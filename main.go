@@ -222,6 +222,9 @@ func main() {
 		// Encode the query parameters back into the URL
 		req.URL.RawQuery = query.Encode()
 
+		// Remove the Authorization header, as we are using the key query parameter
+		req.Header.Del("Authorization")
+
 		// Debug log to confirm query parameters are set
 		log.Printf("Outgoing request URL with key: %s", req.URL.String())
 
