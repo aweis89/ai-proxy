@@ -3,6 +3,7 @@ package main
 import (
 	"bytes" // Add bytes package for body reading/restoring
 	"context"
+	"encoding/json" // Add json package for body manipulation
 	"errors"
 	"flag"
 	"io"
@@ -149,6 +150,7 @@ func main() {
 	keysRaw := flag.String("keys", os.Getenv("GEMINI_API_KEYS"), "Comma-separated list of API keys (required)")
 	removalDuration := flag.Duration("removal-duration", 5*time.Minute, "Duration to remove a failing key from rotation")
 	overrideKeyParam := flag.String("key-param", "key", "The name of the query parameter containing the API key to override")
+	addGoogleSearch := flag.Bool("add-google-search", true, "Automatically add google_search tool if missing in POST requests")
 
 	flag.Parse()
 
@@ -327,6 +329,7 @@ func main() {
 	log.Printf("Forwarding requests to %s", targetURL.String())
 	log.Printf("Overriding query parameter '%s'", *overrideKeyParam)
 	log.Printf("Key removal duration on failure: %s", *removalDuration)
+	log.Printf("Add google_search tool if missing: %t", *addGoogleSearch)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request: %s %s%s", r.Method, r.Host, r.URL.RequestURI())
@@ -338,10 +341,60 @@ func main() {
 				log.Printf("Error reading request body: %v", err)
 				// Decide how to handle: maybe return an error response?
 				// For now, just log and continue, but the proxy might fail.
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes)) // Restore body even if read failed partially
 			} else {
-				// Log the body content
-				log.Printf("Request Body: %s", string(bodyBytes))
-				// Restore the body so the proxy can read it
+				log.Printf("Original Request Body: %s", string(bodyBytes))
+
+				// --- Conditionally Add Google Search Tool ---
+				if *addGoogleSearch {
+					var requestData map[string]interface{}
+					if err := json.Unmarshal(bodyBytes, &requestData); err != nil {
+						log.Printf("Warning: Failed to parse request body as JSON: %v. Proceeding with original body.", err)
+					} else {
+						needsModification := true // Assume modification is needed unless proven otherwise
+						if toolsVal, ok := requestData["tools"]; ok {
+							if toolsList, ok := toolsVal.([]interface{}); ok {
+								for _, tool := range toolsList {
+									if toolMap, ok := tool.(map[string]interface{}); ok {
+										if _, exists := toolMap["google_search"]; exists {
+											needsModification = false // Found it, no need to add
+											break
+										}
+									}
+								}
+								// If loop finished and needsModification is still true, append the tool
+								if needsModification {
+									log.Println("Adding google_search tool to existing tools list.")
+									googleSearchTool := map[string]interface{}{"google_search": map[string]interface{}{}}
+									requestData["tools"] = append(toolsList, googleSearchTool)
+								}
+							} else {
+								log.Println("Warning: 'tools' field is not an array. Cannot add google_search tool.")
+								needsModification = false // Cannot modify non-array tools field
+							}
+						} else {
+							// 'tools' field doesn't exist, create it
+							log.Println("Adding 'tools' field with google_search tool.")
+							googleSearchTool := map[string]interface{}{"google_search": map[string]interface{}{}}
+							requestData["tools"] = []interface{}{googleSearchTool}
+						}
+
+						// If modification happened, marshal back to JSON
+						if needsModification {
+							modifiedBodyBytes, err := json.Marshal(requestData)
+							if err != nil {
+								log.Printf("Warning: Failed to marshal modified request body: %v. Proceeding with original body.", err)
+								// Keep original bodyBytes
+							} else {
+								log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
+								bodyBytes = modifiedBodyBytes // Use the modified body
+							}
+						}
+					}
+				}
+				// --- End Conditionally Add Google Search Tool ---
+
+				// Restore the body so the proxy can read it (using original or modified bodyBytes)
 				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			}
 		}
