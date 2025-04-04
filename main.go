@@ -6,6 +6,7 @@ import (
 	"encoding/json" // Add json package for body manipulation
 	"errors"
 	"flag"
+	"fmt" // Add fmt package for Sprintf
 	"io"
 	"log"
 	"net/http"
@@ -413,7 +414,12 @@ func main() {
 				// --- End Conditionally Add Google Search Tool ---
 
 				// Restore the body so the proxy can read it (using original or modified bodyBytes)
-				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				// AND update ContentLength if the body was modified.
+				newBodyReader := bytes.NewReader(bodyBytes)
+				r.Body = io.NopCloser(newBodyReader)
+				r.ContentLength = int64(newBodyReader.Len())
+				r.Header.Set("Content-Length", fmt.Sprintf("%d", r.ContentLength)) // Use fmt for simplicity
+				log.Printf("Updated Content-Length to: %d", r.ContentLength) // Add log for confirmation
 			}
 		}
 		// --- End Log POST Request Body ---
