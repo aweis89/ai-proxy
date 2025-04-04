@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes" // Add bytes package for body reading/restoring
 )
 
 // keyManager manages the API keys, rotation, and failure handling.
@@ -327,8 +328,30 @@ func main() {
 	log.Printf("Overriding query parameter '%s'", *overrideKeyParam)
 	log.Printf("Key removal duration on failure: %s", *removalDuration)
 
+	"bytes" // Add bytes package for body reading/restoring
+)
+
+// ... (rest of the imports and code) ...
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request: %s %s%s", r.Method, r.Host, r.URL.RequestURI())
+
+		// --- Log POST Request Body ---
+		if r.Method == http.MethodPost && r.Body != nil {
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				log.Printf("Error reading request body: %v", err)
+				// Decide how to handle: maybe return an error response?
+				// For now, just log and continue, but the proxy might fail.
+			} else {
+				// Log the body content
+				log.Printf("Request Body: %s", string(bodyBytes))
+				// Restore the body so the proxy can read it
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
+		}
+		// --- End Log POST Request Body ---
+
 		// Allow CORS (adjust origins as needed for security)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
