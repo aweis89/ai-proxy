@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -221,6 +222,9 @@ func main() {
 		// Encode the query parameters back into the URL
 		req.URL.RawQuery = query.Encode()
 
+		// Debug log to confirm query parameters are set
+		log.Printf("Outgoing request URL with key: %s", req.URL.String())
+
 		// Ensure the Host header is set correctly for the target host
 		// NewSingleHostReverseProxy usually handles this, but explicit setting can be safer.
 		req.Host = targetURL.Host
@@ -269,6 +273,8 @@ func main() {
 		// Log other client/server errors from the target for debugging
 		if resp.StatusCode >= 400 {
 			log.Printf("Target responded with status %d for key index %d", resp.StatusCode, keyIndex)
+			body, _ := io.ReadAll(resp.Body)
+			log.Println(string(body))
 		}
 
 		return nil // Return nil to indicate success and continue proxying the response
@@ -327,4 +333,3 @@ func main() {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
-
