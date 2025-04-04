@@ -63,11 +63,12 @@ generate-launchctl-config: build
 	echo '</dict>' >> "$${PLIST_PATH}"; \
 	echo '</plist>' >> "$${PLIST_PATH}"; \
 	echo ""; \
-	echo "Successfully generated $${PLIST_PATH}"; \
-	echo "To load the service, run:"; \
-	echo "  launchctl load $${PLIST_PATH}"; \
-	echo "To unload the service, run:"; \
-	echo "  launchctl unload $${PLIST_PATH}"; \
-	echo "To check the status (after loading), run:"; \
-	echo "  launchctl list | grep com.user.aiproxy"; \
-	echo "Logs will be written to $(LOG_FILE)"
+	echo "Attempting to unload existing agent (if any)..."; \
+	launchctl unload "$${PLIST_PATH}" || true; \
+	echo "Loading and enabling agent..."; \
+	launchctl load -w "$${PLIST_PATH}"; \
+	echo "Checking agent status (might take a moment to update)..."; \
+	sleep 2; \
+	launchctl print "gui/$$(id -u)/com.user.aiproxy" || echo "Agent status check failed or agent not running."; \
+	echo ""; \
+	echo "Service 'com.user.aiproxy' configured. Logs will be written to $(LOG_FILE)"
