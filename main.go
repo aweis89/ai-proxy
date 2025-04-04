@@ -225,6 +225,16 @@ func main() {
 		// Debug log to confirm query parameters are set
 		log.Printf("Outgoing request URL with key: %s", req.URL.String())
 
+		// Log outgoing headers
+		log.Println("--- Outgoing Request Headers ---")
+		for name, values := range req.Header {
+			// Loop over all values for the name.
+			for _, value := range values {
+				log.Printf("%s: %s", name, value)
+			}
+		}
+		log.Println("------------------------------")
+
 		// Ensure the Host header is set correctly for the target host
 		// NewSingleHostReverseProxy usually handles this, but explicit setting can be safer.
 		req.Host = targetURL.Host
