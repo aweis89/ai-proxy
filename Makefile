@@ -1,4 +1,4 @@
-.PHONY: run
+.PHONY: run logs
 
 # Default log file path
 LOG_FILE ?= $(HOME)/tmp/ai-proxy.log
@@ -14,3 +14,7 @@ run:
 
 # You can override the log file path like this:
 # make run LOG_FILE=/path/to/your/log/file.log
+
+logs:
+	@echo "Tailing log file: $(LOG_FILE)"
+	@tail -f $(LOG_FILE)
