@@ -75,9 +75,10 @@ The included `Makefile` simplifies common tasks. The default log file location i
     export GEMINI_API_KEYS="YOUR_KEY_1,YOUR_KEY_2"
     make generate-launchctl-config
     ```
-    This builds the binary and generates a `.plist` file in `~/Library/LaunchAgents/` to run the proxy as a background service managed by `launchd`.
+    This builds the binary, generates a `.plist` file in `~/Library/LaunchAgents/`, and then automatically attempts to unload any existing version and load/enable the new service using `launchctl load -w`. This configures the proxy to run as a background service managed by `launchd` and start automatically on login.
     *   **Requires `GEMINI_API_KEYS`:** The environment variable *must* be set when running this command.
-    *   Follow the output instructions to load/unload the service using `launchctl`. Logs will go to the path specified in the Makefile (default `~/tmp/ai-proxy.log`).
+    *   The command output will indicate if the service was loaded successfully. Logs will go to the path specified in the Makefile (default `~/tmp/ai-proxy.log`).
+    *   You can manually unload the service later using: `launchctl unload ~/Library/LaunchAgents/com.user.aiproxy.plist`
 
 ## Direct Usage (Without Make)
 
