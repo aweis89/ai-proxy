@@ -419,7 +419,7 @@ func main() {
 				r.Body = io.NopCloser(newBodyReader)
 				r.ContentLength = int64(newBodyReader.Len())
 				r.Header.Set("Content-Length", fmt.Sprintf("%d", r.ContentLength)) // Use fmt for simplicity
-				log.Printf("Updated Content-Length to: %d", r.ContentLength) // Add log for confirmation
+				log.Printf("Updated Content-Length to: %d", r.ContentLength)       // Add log for confirmation
 			}
 		}
 		// --- End Log POST Request Body ---
