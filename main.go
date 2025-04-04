@@ -150,7 +150,7 @@ func main() {
 	keysRaw := flag.String("keys", os.Getenv("GEMINI_API_KEYS"), "Comma-separated list of API keys (required)")
 	removalDuration := flag.Duration("removal-duration", 5*time.Minute, "Duration to remove a failing key from rotation")
 	overrideKeyParam := flag.String("key-param", "key", "The name of the query parameter containing the API key to override")
-	addGoogleSearch := flag.Bool("add-google-search", true, "Automatically add google_search tool if missing in POST requests")
+	addGoogleSearch := flag.Bool("add-google-search", false, "Automatically add google_search tool if missing in POST requests")
 
 	flag.Parse()
 
