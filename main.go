@@ -352,62 +352,22 @@ func main() {
 					if err := json.Unmarshal(bodyBytes, &requestData); err != nil {
 						log.Printf("Warning: Failed to parse request body as JSON: %v. Proceeding with original body.", err)
 					} else {
-						needsModification := true // Assume modification is needed unless proven otherwise
-						if toolsVal, ok := requestData["tools"]; ok {
-							if toolsList, ok := toolsVal.([]interface{}); ok {
-								for _, tool := range toolsList {
-									if toolMap, ok := tool.(map[string]interface{}); ok {
-										if _, exists := toolMap["google_search"]; exists {
-											needsModification = false // Found it, no need to add
-											break
-										}
-									}
-								}
-								// If loop finished and needsModification is still true, append the tool
-								if needsModification {
-									log.Println("Adding google_search tool to existing tools list.")
-									// Define the correct structure for the Google Search tool
-									googleSearchTool := map[string]interface{}{
-										"function_declarations": []map[string]interface{}{
-											{
-												"name":        "google_search",
-												"description": "Tool for searching the web", // Optional but recommended
-											},
-										},
-									}
-									requestData["tools"] = append(toolsList, googleSearchTool)
-								}
-							} else {
-								log.Println("Warning: 'tools' field is not an array. Cannot add google_search tool.")
-								needsModification = false // Cannot modify non-array tools field
-							}
-						} else {
-							// 'tools' field doesn't exist, create it
-							log.Println("Adding 'tools' field with google_search tool.")
-							// Define the correct structure for the Google Search tool
-							googleSearchTool := map[string]interface{}{
-								"function_declarations": []map[string]interface{}{
-									{
-										"name":        "google_search",
-										"description": "Tool for searching the web", // Optional but recommended
-									},
-								},
-							}
-							requestData["tools"] = []interface{}{googleSearchTool}
-							// Mark as needing modification since we just added the tools field
-							needsModification = true
+						// Define the desired google_search tool structure
+						googleSearchTool := map[string]interface{}{
+							"google_search": map[string]interface{}{}, // Empty object as per user request
 						}
+						// Overwrite or create the 'tools' field with the desired structure
+						requestData["tools"] = []interface{}{googleSearchTool}
+						log.Println("Setting 'tools' field to contain only google_search.")
 
-						// If modification happened, marshal back to JSON
-						if needsModification {
-							modifiedBodyBytes, err := json.Marshal(requestData)
-							if err != nil {
-								log.Printf("Warning: Failed to marshal modified request body: %v. Proceeding with original body.", err)
-								// Keep original bodyBytes
-							} else {
-								log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
-								bodyBytes = modifiedBodyBytes // Use the modified body
-							}
+						// Marshal the modified data back to JSON
+						modifiedBodyBytes, err := json.Marshal(requestData)
+						if err != nil {
+							log.Printf("Warning: Failed to marshal modified request body: %v. Proceeding with original body.", err)
+							// Keep original bodyBytes (although modification failed)
+						} else {
+							log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
+							bodyBytes = modifiedBodyBytes // Use the modified body
 						}
 					}
 				}
