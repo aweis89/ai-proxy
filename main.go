@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes" // Add bytes package for body reading/restoring
 	"context"
 	"errors"
 	"flag"
@@ -14,7 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"bytes" // Add bytes package for body reading/restoring
 )
 
 // keyManager manages the API keys, rotation, and failure handling.
@@ -327,11 +327,6 @@ func main() {
 	log.Printf("Forwarding requests to %s", targetURL.String())
 	log.Printf("Overriding query parameter '%s'", *overrideKeyParam)
 	log.Printf("Key removal duration on failure: %s", *removalDuration)
-
-	"bytes" // Add bytes package for body reading/restoring
-)
-
-// ... (rest of the imports and code) ...
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request: %s %s%s", r.Method, r.Host, r.URL.RequestURI())
