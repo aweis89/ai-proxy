@@ -365,7 +365,15 @@ func main() {
 								// If loop finished and needsModification is still true, append the tool
 								if needsModification {
 									log.Println("Adding google_search tool to existing tools list.")
-									googleSearchTool := map[string]interface{}{"google_search": map[string]interface{}{}}
+									// Define the correct structure for the Google Search tool
+									googleSearchTool := map[string]interface{}{
+										"function_declarations": []map[string]interface{}{
+											{
+												"name":        "google_search",
+												"description": "Tool for searching the web", // Optional but recommended
+											},
+										},
+									}
 									requestData["tools"] = append(toolsList, googleSearchTool)
 								}
 							} else {
@@ -375,8 +383,18 @@ func main() {
 						} else {
 							// 'tools' field doesn't exist, create it
 							log.Println("Adding 'tools' field with google_search tool.")
-							googleSearchTool := map[string]interface{}{"google_search": map[string]interface{}{}}
+							// Define the correct structure for the Google Search tool
+							googleSearchTool := map[string]interface{}{
+								"function_declarations": []map[string]interface{}{
+									{
+										"name":        "google_search",
+										"description": "Tool for searching the web", // Optional but recommended
+									},
+								},
+							}
 							requestData["tools"] = []interface{}{googleSearchTool}
+							// Mark as needing modification since we just added the tools field
+							needsModification = true
 						}
 
 						// If modification happened, marshal back to JSON
