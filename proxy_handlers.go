@@ -22,7 +22,7 @@ func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyPara
 		if err != nil {
 			log.Printf("Director Error: Could not get next key: %v", err)
 			// Add error to context for ErrorHandler
-			*req = *req.WithContext(context.WithValue(req.Context(), "proxyError", err))
+			*req = *req.WithContext(context.WithValue(req.Context(), proxyErrorContextKey, err))
 			return
 		}
 
@@ -100,7 +100,7 @@ func createProxyErrorHandler() func(http.ResponseWriter, *http.Request, error) {
 	return func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("Proxy ErrorHandler triggered: %v", err)
 
-		proxyErrVal := req.Context().Value("proxyError")
+		proxyErrVal := req.Context().Value(proxyErrorContextKey)
 		if proxyErr, ok := proxyErrVal.(error); ok {
 			http.Error(rw, "Proxy error: "+proxyErr.Error(), http.StatusServiceUnavailable)
 			return

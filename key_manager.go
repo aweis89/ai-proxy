@@ -18,10 +18,13 @@ type keyManager struct {
 	removalDuration time.Duration
 }
 
-// Context key type for associating the used key index with a request.
+// Context key type for associating values with a request.
 type contextKey string
 
-const keyIndexContextKey contextKey = "keyIndex"
+const (
+	keyIndexContextKey   contextKey = "keyIndex"
+	proxyErrorContextKey contextKey = "proxyError"
+)
 
 // newKeyManager creates and initializes a key manager.
 func newKeyManager(keys []string, removalDuration time.Duration) (*keyManager, error) {
