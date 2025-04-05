@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 )
 
 // createProxyDirector returns a function that modifies the request before forwarding.
@@ -193,7 +193,7 @@ func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool) http.
 			newBodyReader := bytes.NewReader(bodyBytes)
 			r.Body = io.NopCloser(newBodyReader)
 			r.ContentLength = int64(newBodyReader.Len())
-			r.Header.Set("Content-Length", fmt.Sprintf("%d", r.ContentLength))
+			r.Header.Set("Content-Length", strconv.FormatInt(r.ContentLength, 10))
 			log.Printf("Updated Content-Length to: %d", r.ContentLength)
 		}
 
