@@ -13,11 +13,11 @@ run:
 	@echo "Starting the AI proxy in the background..."
 	@echo "Output will be logged to $(LOG_FILE)"
 	@mkdir -p $(dir $(LOG_FILE))
-	@nohup go run $(CURDIR)/main.go > $(LOG_FILE) 2>&1 &
+	@nohup go run $(CURDIR)/. > $(LOG_FILE) 2>&1 &
 
 build:
 	@echo "Building $(BINARY_NAME)..."
-	@go build -o $(CURDIR)/$(BINARY_NAME) $(CURDIR)/main.go
+	@go build -o $(CURDIR)/$(BINARY_NAME) $(CURDIR)/.
 
 # You can override the log file path like this:
 # make run LOG_FILE=/path/to/your/log/file.log
