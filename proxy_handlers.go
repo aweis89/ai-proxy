@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -117,87 +118,130 @@ func createProxyErrorHandler() func(http.ResponseWriter, *http.Request, error) {
 	}
 }
 
+// handlePostBody processes the POST request body and returns the modified body and any error.
+func handlePostBody(body io.ReadCloser, addGoogleSearch bool) ([]byte, error) {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+	log.Printf("Original Request Body: %s", string(bodyBytes))
+
+	if !addGoogleSearch {
+		return bodyBytes, nil
+	}
+
+	return modifyBodyWithGoogleSearch(bodyBytes)
+}
+
+// modifyBodyWithGoogleSearch adds the Google Search tool to the request body if needed.
+func modifyBodyWithGoogleSearch(bodyBytes []byte) ([]byte, error) {
+	var requestData map[string]any
+	if err := json.Unmarshal(bodyBytes, &requestData); err != nil {
+		log.Printf("Warning: Failed to parse request body as JSON: %v. Proceeding with original body.", err)
+		return bodyBytes, nil
+	}
+
+	googleSearchTool := map[string]any{
+		"google_search": map[string]any{},
+	}
+
+	_, modified := addGoogleSearchToTools(requestData, googleSearchTool)
+	if !modified {
+		return bodyBytes, nil
+	}
+
+	// We don't need to do anything here as the addGoogleSearchToTools function
+	// now handles the modification of the tools structure directly
+	// when it's a functionDeclarations array
+
+	modifiedBodyBytes, err := json.Marshal(requestData)
+	if err != nil {
+		log.Printf("Warning: Failed to marshal modified request body: %v. Proceeding with original body.", err)
+		return bodyBytes, nil
+	}
+
+	log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
+	return modifiedBodyBytes, nil
+}
+
+// addGoogleSearchToTools handles the addition of Google Search tool to the tools section.
+func addGoogleSearchToTools(requestData map[string]any, googleSearchTool map[string]any) ([]any, bool) {
+	var toolsSlice []any
+	googleSearchFound := false
+
+	if toolsVal, ok := requestData["tools"]; ok {
+		// Handle array format (direct tools array)
+		if slice, ok := toolsVal.([]any); ok {
+			toolsSlice = slice
+			for _, tool := range toolsSlice {
+				if toolMap, ok := tool.(map[string]any); ok {
+					if _, exists := toolMap["google_search"]; exists {
+						googleSearchFound = true
+						log.Println("'google_search' tool already present in request.")
+						break
+					}
+				}
+			}
+		} else if toolsMap, ok := toolsVal.(map[string]any); ok {
+			// Handle object format with functionDeclarations
+			if declarations, ok := toolsMap["functionDeclarations"].([]any); ok {
+				toolsSlice = declarations
+				for _, decl := range declarations {
+					if declMap, ok := decl.(map[string]any); ok {
+						if name, ok := declMap["name"].(string); ok && name == "google_search" {
+							googleSearchFound = true
+							log.Println("'google_search' tool already present in request.")
+							break
+						}
+					}
+				}
+
+				// If we need to add the tool and not found
+				if !googleSearchFound {
+					log.Println("Adding 'google_search' to existing functionDeclarations.")
+					// Convert our google_search tool to a functionDeclaration format
+					googleSearchDecl := map[string]any{
+						"name":        "google_search",
+						"description": "Search Google for real-time information",
+						"parameters": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"query": map[string]any{
+									"type":        "string",
+									"description": "The search query",
+								},
+							},
+							"required": []string{"query"},
+						},
+					}
+					toolsMap["functionDeclarations"] = append(declarations, googleSearchDecl)
+					return toolsSlice, true // We return the original slice, but the modification is in the map
+				}
+				return toolsSlice, false
+			}
+		}
+	}
+
+	if googleSearchFound {
+		return toolsSlice, false
+	}
+
+	if toolsSlice == nil {
+		log.Println("Creating 'tools' field with 'google_search'.")
+		return []any{googleSearchTool}, true
+	}
+
+	log.Println("Appending 'google_search' tool to existing tools.")
+	return append(toolsSlice, googleSearchTool), true
+}
+
 // createMainHandler returns the main HTTP handler function.
 // It logs requests, handles CORS, optionally modifies POST bodies, and forwards requests to the proxy.
 func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request: %s %s%s", r.Method, r.Host, r.URL.RequestURI())
 
-		// --- Log and Modify POST Request Body ---
-		if r.Method == http.MethodPost && r.Body != nil {
-			bodyBytes, err := io.ReadAll(r.Body)
-			if err != nil {
-				log.Printf("Error reading request body: %v", err)
-				http.Error(w, "Error reading request body", http.StatusInternalServerError)
-				return
-			}
-			log.Printf("Original Request Body: %s", string(bodyBytes))
-
-			// --- Conditionally Add Google Search Tool ---
-			if addGoogleSearch {
-				var requestData map[string]any // Use 'any' instead of 'interface{}'
-				if err := json.Unmarshal(bodyBytes, &requestData); err != nil {
-					log.Printf("Warning: Failed to parse request body as JSON: %v. Proceeding with original body.", err)
-				} else {
-					googleSearchTool := map[string]any{
-						"google_search": map[string]any{},
-					}
-					googleSearchFound := false
-					var toolsSlice []any
-
-					// Check if 'tools' exists and is a slice
-					if toolsVal, ok := requestData["tools"]; ok {
-						if slice, ok := toolsVal.([]any); ok {
-							toolsSlice = slice
-							// Check if google_search tool already exists
-							for _, tool := range toolsSlice {
-								if toolMap, ok := tool.(map[string]any); ok {
-									if _, exists := toolMap["google_search"]; exists {
-										googleSearchFound = true
-										log.Println("'google_search' tool already present in request.")
-										break
-									}
-								}
-							}
-						} else {
-							log.Printf("Warning: 'tools' field is not a slice, type is %T. Overwriting.", toolsVal)
-							// Treat as if 'tools' doesn't exist or is invalid, will create new slice below
-						}
-					}
-
-					// If google_search was not found, add it
-					if !googleSearchFound {
-						if toolsSlice == nil {
-							// 'tools' didn't exist or wasn't a valid slice, create a new one
-							log.Println("Creating 'tools' field with 'google_search'.")
-							toolsSlice = []any{googleSearchTool}
-						} else {
-							// 'tools' existed and was a slice, append google_search
-							log.Println("Appending 'google_search' tool to existing tools.")
-							toolsSlice = append(toolsSlice, googleSearchTool)
-						}
-						requestData["tools"] = toolsSlice
-					}
-
-					// Marshal the potentially modified requestData
-					modifiedBodyBytes, err := json.Marshal(requestData)
-					if err != nil {
-						log.Printf("Warning: Failed to marshal modified request body: %v. Proceeding with original body.", err)
-					} else {
-						log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
-						bodyBytes = modifiedBodyBytes // Use the modified body
-					}
-				}
-			}
-
-			newBodyReader := bytes.NewReader(bodyBytes)
-			r.Body = io.NopCloser(newBodyReader)
-			r.ContentLength = int64(newBodyReader.Len())
-			r.Header.Set("Content-Length", strconv.FormatInt(r.ContentLength, 10))
-			log.Printf("Updated Content-Length to: %d", r.ContentLength)
-		}
-
-		// Allow CORS
+		// Handle CORS headers first
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
@@ -206,6 +250,24 @@ func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool) http.
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+
+		// Process POST request body if present
+		if r.Method == http.MethodPost && r.Body != nil {
+			modifiedBody, err := handlePostBody(r.Body, addGoogleSearch)
+			if err != nil {
+				log.Printf("Error reading request body: %v", err)
+				http.Error(w, "Error reading request body", http.StatusInternalServerError)
+				return
+			}
+
+			// Update request with modified body
+			newBodyReader := bytes.NewReader(modifiedBody)
+			r.Body = io.NopCloser(newBodyReader)
+			r.ContentLength = int64(len(modifiedBody))
+			r.Header.Set("Content-Length", strconv.FormatInt(r.ContentLength, 10))
+			log.Printf("Updated Content-Length to: %d", r.ContentLength)
+		}
+
 		proxy.ServeHTTP(w, r)
 	}
 }
