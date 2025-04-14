@@ -3,8 +3,8 @@ package main
 import (
 	"errors"
 	"log"
+	"math/rand/v2"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -14,7 +14,6 @@ type keyManager struct {
 	keys            []string          // Original list of keys
 	availableKeys   map[int]string    // Keys currently available for use (index -> key)
 	failingKeys     map[int]time.Time // Keys currently failing (index -> reactivation time)
-	currentIndex    uint64            // Atomic counter for round-robin index
 	removalDuration time.Duration
 }
 
@@ -55,7 +54,6 @@ func newKeyManager(keys []string, removalDuration time.Duration) (*keyManager, e
 		availableKeys:   available,
 		failingKeys:     make(map[int]time.Time),
 		removalDuration: removalDuration,
-		// currentIndex starts at 0 implicitly
 	}, nil
 }
 
@@ -99,13 +97,13 @@ func (km *keyManager) getNextKey() (string, int, error) {
 		return "", -1, errors.New("internal error: key list is empty")
 	}
 
-	// Try finding an available key starting from the current index
+	// Try finding an available key starting from a random index
 	// We loop max len(km.keys) times to ensure we check every possible slot
 	// in case the available keys are sparse.
-	startIndex := atomic.AddUint64(&km.currentIndex, 1) - 1 // Get current value and increment for next time
-	for i := uint64(0); i < numOriginalKeys; i++ {
-		currentIndex := (startIndex + i) % numOriginalKeys
-		keyIndex := int(currentIndex)
+	startIndex := rand.IntN(int(numOriginalKeys)) // Generate a random starting index
+	for i := range int(numOriginalKeys) {
+		currentIndex := (startIndex + i) % int(numOriginalKeys)
+		keyIndex := currentIndex // Use the calculated index directly
 
 		if key, ok := km.availableKeys[keyIndex]; ok {
 			// Found an available key
