@@ -145,19 +145,35 @@ func modifyBodyWithGoogleSearch(bodyBytes []byte) ([]byte, error) {
 		"google_search": map[string]any{},
 	}
 
-	_, modified := addGoogleSearchToTools(requestData, googleSearchTool)
+	// Call addGoogleSearchToTools and capture the returned slice
+	newToolsSlice, modified := addGoogleSearchToTools(requestData, googleSearchTool)
 	if !modified {
-		return bodyBytes, nil
+		log.Println("No modification needed for tools.")
+		return bodyBytes, nil // No changes needed
 	}
 
-	// We don't need to do anything here as the addGoogleSearchToTools function
-	// now handles the modification of the tools structure directly
-	// when it's a functionDeclarations array
+	// If modified, we need to ensure requestData["tools"] is correctly set.
+	// Check if the 'tools' field in the original data was NOT the map structure
+	// that gets modified in place by addGoogleSearchToTools.
+	if toolsVal, ok := requestData["tools"]; ok {
+		if _, isMap := toolsVal.(map[string]any); !isMap {
+			// If 'tools' existed but wasn't the map structure (i.e., it was a direct array),
+			// update it with the new slice returned by the function.
+			log.Println("Updating existing 'tools' array.")
+			requestData["tools"] = newToolsSlice
+		}
+		// If it *was* the map structure, addGoogleSearchToTools modified it in place,
+		// so no assignment is needed here. The log inside addGoogleSearchToTools covers this.
+	} else {
+		// If 'tools' field didn't exist originally, assign the new slice.
+		log.Println("Assigning newly created 'tools' field.")
+		requestData["tools"] = newToolsSlice
+	}
 
 	modifiedBodyBytes, err := json.Marshal(requestData)
 	if err != nil {
-		log.Printf("Warning: Failed to marshal modified request body: %v. Proceeding with original body.", err)
-		return bodyBytes, nil
+		// It's generally better to return the error here so the caller knows marshaling failed.
+		return nil, fmt.Errorf("failed to marshal modified request body: %w", err)
 	}
 
 	log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
