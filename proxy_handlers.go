@@ -69,15 +69,9 @@ func createProxyModifyResponse(keyMan *keyManager) func(*http.Response) error {
 			return nil
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests ||
-			resp.StatusCode == http.StatusBadRequest ||
-			resp.StatusCode == http.StatusForbidden {
+		if resp.StatusCode >= 400 {
 			log.Printf("Request using key index %d failed with status %d. Marking key as failing.", keyIndex, resp.StatusCode)
 			keyMan.markKeyFailed(keyIndex)
-		}
-
-		if resp.StatusCode >= 400 {
-			log.Printf("Target responded with status %d for key index %d", resp.StatusCode, keyIndex)
 			// Log response body for errors
 			bodyBytes, err := io.ReadAll(resp.Body)
 			if err != nil {
