@@ -62,7 +62,7 @@ func createProxyModifyResponse(keyMan *keyManager) func(*http.Response) error {
 
 		// If no keyIndex was added (e.g., director failed), check for a proxyError
 		if keyIndexVal == nil {
-			proxyErrVal := resp.Request.Context().Value(proxyErrorContextKey) // Use defined constant
+			proxyErrVal := resp.Request.Context().Value(proxyErrorContextKey)  // Use defined constant
 			if proxyErr, ok := proxyErrVal.(error); ok && proxyErrVal != nil { // Explicit nil check
 				log.Printf("Error occurred during key selection for this request: %v", proxyErr)
 			} else {
@@ -89,7 +89,7 @@ func createProxyModifyResponse(keyMan *keyManager) func(*http.Response) error {
 				// Restore empty body if read fails
 				resp.Body = io.NopCloser(bytes.NewBuffer(nil))
 			} else {
-				log.Printf("Non-2xx Response Body (Status %d): %s", resp.StatusCode, string(bodyBytes))
+				log.Printf("Non-2xx Response Body (Status %d)", resp.StatusCode)
 				// Restore the body so the client can read it
 				resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			}
@@ -165,23 +165,6 @@ func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool, searc
 			log.Printf("Updated Content-Length to: %d for %s", r.ContentLength, r.URL.Path)
 		} else if r.Method == http.MethodPost && r.Body != nil {
 			log.Printf("Path %s does not match Gemini pattern, forwarding POST body unmodified.", r.URL.Path)
-			// For other POST requests, we still need to read the body to avoid issues,
-			// but we don't modify it. We can read it and immediately put it back.
-			// Alternatively, if the proxy handles reading the original body correctly,
-			// we might not need to do anything here. Let's assume the proxy handles it.
-			// If issues arise (e.g., body not being sent), we might need to read and replace:
-			/*
-				originalBodyBytes, err := io.ReadAll(r.Body)
-				if err != nil {
-					log.Printf("Error reading original request body for %s: %v", r.URL.Path, err)
-					http.Error(w, "Error reading request body", http.StatusInternalServerError)
-					return
-				}
-				r.Body.Close() // Close original body
-				r.Body = io.NopCloser(bytes.NewReader(originalBodyBytes))
-				r.ContentLength = int64(len(originalBodyBytes))
-				// No need to reset Content-Length header if we didn't change the length
-			*/
 		}
 
 		proxy.ServeHTTP(w, r)
