@@ -31,12 +31,18 @@ func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyPara
 		log.Printf("Using key index %d for request to %s", keyIndex, req.URL.Path)
 		*req = *req.WithContext(context.WithValue(req.Context(), keyIndexContextKey, keyIndex))
 
-		query := req.URL.Query()
-		query.Set(overrideKeyParam, apiKey)
-		req.URL.RawQuery = query.Encode()
-		req.Header.Del("Authorization")
+		existingHeader := req.Header.Get("Authorization")
+		if existingHeader != "" {
+			// Set the Authorization header, replacing any existing one. Assuming Bearer token format.
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			fmt.Printf("Authorization header set to: %s", apiKey)
+		} else {
+			query := req.URL.Query()
+			query.Set(overrideKeyParam, apiKey)
+			req.URL.RawQuery = query.Encode()
+			log.Printf("Outgoing request URL with key: %s", req.URL.String())
+		}
 
-		log.Printf("Outgoing request URL with key: %s", req.URL.String())
 		log.Println("--- Outgoing Request Headers ---")
 		for name, values := range req.Header {
 			for _, value := range values {
@@ -326,8 +332,11 @@ func modifyBodyWithGoogleSearch(bodyBytes []byte, searchTrigger string) ([]byte,
 	return modifiedBodyBytes, nil
 }
 
+// Compile the regex for matching Gemini model paths once
+var geminiPathRegex = regexp.MustCompile(`^/v1beta/models/gemini-.*`)
+
 // createMainHandler returns the main HTTP handler function.
-// It logs requests, handles CORS, optionally modifies POST bodies, and forwards requests to the proxy.
+// It logs requests, handles CORS, optionally modifies POST bodies for specific paths, and forwards requests to the proxy.
 func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool, searchTrigger string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request: %s %s%s", r.Method, r.Host, r.URL.RequestURI())
@@ -342,21 +351,41 @@ func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool, searc
 			return
 		}
 
-		// Process POST request body if present
-		if r.Method == http.MethodPost && r.Body != nil {
+		// Conditionally process POST request body for specific paths
+		if r.Method == http.MethodPost && r.Body != nil && geminiPathRegex.MatchString(r.URL.Path) {
+			log.Printf("Path %s matches Gemini pattern, processing POST body.", r.URL.Path)
 			modifiedBody, err := handlePostBody(r.Body, addGoogleSearch, searchTrigger)
 			if err != nil {
-				log.Printf("Error processing request body: %v", err)
+				log.Printf("Error processing request body for %s: %v", r.URL.Path, err)
 				http.Error(w, "Error processing request body", http.StatusInternalServerError)
 				return
 			}
 
-			// Update request with modified body
+			// Update request with modified body only if it was processed
 			newBodyReader := bytes.NewReader(modifiedBody)
 			r.Body = io.NopCloser(newBodyReader)
 			r.ContentLength = int64(len(modifiedBody))
 			r.Header.Set("Content-Length", strconv.FormatInt(r.ContentLength, 10))
-			log.Printf("Updated Content-Length to: %d", r.ContentLength)
+			log.Printf("Updated Content-Length to: %d for %s", r.ContentLength, r.URL.Path)
+		} else if r.Method == http.MethodPost && r.Body != nil {
+			log.Printf("Path %s does not match Gemini pattern, forwarding POST body unmodified.", r.URL.Path)
+			// For other POST requests, we still need to read the body to avoid issues,
+			// but we don't modify it. We can read it and immediately put it back.
+			// Alternatively, if the proxy handles reading the original body correctly,
+			// we might not need to do anything here. Let's assume the proxy handles it.
+			// If issues arise (e.g., body not being sent), we might need to read and replace:
+			/*
+				originalBodyBytes, err := io.ReadAll(r.Body)
+				if err != nil {
+					log.Printf("Error reading original request body for %s: %v", r.URL.Path, err)
+					http.Error(w, "Error reading request body", http.StatusInternalServerError)
+					return
+				}
+				r.Body.Close() // Close original body
+				r.Body = io.NopCloser(bytes.NewReader(originalBodyBytes))
+				r.ContentLength = int64(len(originalBodyBytes))
+				// No need to reset Content-Length header if we didn't change the length
+			*/
 		}
 
 		proxy.ServeHTTP(w, r)
