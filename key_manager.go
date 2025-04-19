@@ -57,11 +57,16 @@ func newKeyManager(keys []string, removalDuration time.Duration) (*keyManager, e
 	}, nil
 }
 
-// getNextKey selects the next available key using round-robin.
-// It returns the key, its original index, and an error if none are available.
 func (km *keyManager) getNextKey() (string, int, error) {
 	km.mu.Lock()
 	defer km.mu.Unlock()
+
+	// Check if the original key list is empty *first*
+	numOriginalKeys := uint64(len(km.keys))
+	if numOriginalKeys == 0 { // Should be caught by constructor, but safety first
+		log.Println("Error: Key list is empty in getNextKey.")
+		return "", -1, errors.New("internal error: key list is empty")
+	}
 
 	now := time.Now()
 
@@ -76,26 +81,38 @@ func (km *keyManager) getNextKey() (string, int, error) {
 
 	// 2. Check if any keys are available
 	if len(km.availableKeys) == 0 {
-		log.Println("Error: No API keys currently available.")
-		// Check if it's because *all* keys are temporarily failing
-		if len(km.failingKeys) > 0 {
-			earliestReactivation := time.Time{}
-			for _, t := range km.failingKeys {
-				if earliestReactivation.IsZero() || t.Before(earliestReactivation) {
-					earliestReactivation = t
+		// Check if it's because *all* original keys are temporarily failing
+		if len(km.failingKeys) > 0 && len(km.failingKeys) == int(numOriginalKeys) { // Compare with original count
+			log.Println("All keys were temporarily failing. Reactivating all keys immediately.")
+
+			// Collect indices to reactivate
+			indicesToReactivate := make([]int, 0, len(km.failingKeys))
+			for index := range km.failingKeys {
+				indicesToReactivate = append(indicesToReactivate, index)
+			}
+
+			// Reactivate collected indices
+			for _, index := range indicesToReactivate {
+				if index >= 0 && index < int(numOriginalKeys) { // Ensure index is valid
+					km.availableKeys[index] = km.keys[index]
+					delete(km.failingKeys, index)
+					// Optional: Log forceful reactivation
+					// log.Printf("Forcefully reactivated key index %d", index)
+				} else {
+					log.Printf("Warning: Tried to reactivate key index %d which is out of bounds for the original key list.", index)
+					delete(km.failingKeys, index) // Still remove from failing if somehow invalid
 				}
 			}
-			return "", -1, errors.New("all keys are temporarily failing. Next reactivation: " + earliestReactivation.Format(time.RFC3339))
+			// Do NOT return an error here. Proceed to step 3 to select a key.
+			log.Printf("Reactivated %d keys. Now selecting next available key.", len(km.availableKeys))
+		} else {
+			// This case means no keys are available, and it's *not* because all are temporarily failing.
+			log.Println("Error: No API keys currently available and not all keys were failing.")
+			return "", -1, errors.New("no keys configured or available") // Return the original error
 		}
-		// Should not happen if validation passed, but safeguard
-		return "", -1, errors.New("no keys configured or available")
 	}
 
-	// 3. Find the next available key using atomic round-robin
-	numOriginalKeys := uint64(len(km.keys))
-	if numOriginalKeys == 0 { // Should be caught earlier, but safety first
-		return "", -1, errors.New("internal error: key list is empty")
-	}
+	// 3. Find the next available key using random start
 
 	// Try finding an available key starting from a random index
 	// We loop max len(km.keys) times to ensure we check every possible slot
@@ -112,7 +129,7 @@ func (km *keyManager) getNextKey() (string, int, error) {
 	}
 
 	// If we looped through all original indices and found nothing in availableKeys
-	// (This implies availableKeys is empty, which should have been caught earlier)
+	// (This implies availableKeys is empty, which should have been caught earlier or handled by the reactivation block)
 	log.Println("Error: Could not find an available key despite availableKeys map not being empty (Concurrency issue?).")
 	return "", -1, errors.New("no available key found after checking all indices")
 }
