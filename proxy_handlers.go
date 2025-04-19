@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strconv"
 )
 
@@ -69,19 +70,24 @@ func createProxyModifyResponse(keyMan *keyManager) func(*http.Response) error {
 			return nil
 		}
 
-		if resp.StatusCode >= 400 {
-			log.Printf("Request using key index %d failed with status %d. Marking key as failing.", keyIndex, resp.StatusCode)
-			keyMan.markKeyFailed(keyIndex)
-			// Log response body for errors
+		// Log response body for non-2xx status codes
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Printf("Request using key index %d received non-2xx status: %d", keyIndex, resp.StatusCode)
 			bodyBytes, err := io.ReadAll(resp.Body)
 			if err != nil {
-				log.Printf("Error reading error response body: %v", err)
+				log.Printf("Error reading non-2xx response body: %v", err)
 				// Restore empty body if read fails
 				resp.Body = io.NopCloser(bytes.NewBuffer(nil))
 			} else {
-				log.Printf("Error Response Body: %s", string(bodyBytes))
+				log.Printf("Non-2xx Response Body (Status %d): %s", resp.StatusCode, string(bodyBytes))
 				// Restore the body so the client can read it
 				resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			}
+
+			// Still mark key as failed only for >= 400 status codes
+			if resp.StatusCode >= 400 {
+				log.Printf("Marking key index %d as failing due to status %d.", keyIndex, resp.StatusCode)
+				keyMan.markKeyFailed(keyIndex)
 			}
 		}
 
@@ -113,7 +119,7 @@ func createProxyErrorHandler() func(http.ResponseWriter, *http.Request, error) {
 }
 
 // handlePostBody processes the POST request body and returns the modified body and any error.
-func handlePostBody(body io.ReadCloser, addGoogleSearch bool) ([]byte, error) {
+func handlePostBody(body io.ReadCloser, addGoogleSearch bool, searchTrigger string) ([]byte, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
@@ -124,49 +130,195 @@ func handlePostBody(body io.ReadCloser, addGoogleSearch bool) ([]byte, error) {
 		return bodyBytes, nil
 	}
 
-	return modifyBodyWithGoogleSearch(bodyBytes)
+	return modifyBodyWithGoogleSearch(bodyBytes, searchTrigger)
 }
 
-// modifyBodyWithGoogleSearch adds the Google Search tool to the request body if needed.
-func modifyBodyWithGoogleSearch(bodyBytes []byte) ([]byte, error) {
+// modifyBodyWithGoogleSearch conditionally adds the Google Search tool and modifies the request body.
+func modifyBodyWithGoogleSearch(bodyBytes []byte, searchTrigger string) ([]byte, error) {
 	var requestData map[string]any
 	if err := json.Unmarshal(bodyBytes, &requestData); err != nil {
+		// Non-JSON body or parse error, return original
 		log.Printf("Warning: Failed to parse request body as JSON: %v. Proceeding with original body.", err)
 		return bodyBytes, nil
+	}
+
+	modified := false
+	triggerFound := false
+	hasFunctionDeclarations := false
+
+	// --- Check for trigger word in message content ---
+	// Assuming structure: {"contents": [{"parts": [{"text": "..."}]}]}
+	if contents, ok := requestData["contents"].([]any); ok {
+		for _, contentItem := range contents {
+			if contentMap, ok := contentItem.(map[string]any); ok {
+				if parts, ok := contentMap["parts"].([]any); ok {
+					// Compile regex for word boundary matching (case-insensitive)
+					// We compile it here in case searchTrigger changes, though it's passed as an arg
+					// If performance becomes an issue with many parts, consider compiling once outside the loop
+					triggerPattern := `(?i)\b` + regexp.QuoteMeta(searchTrigger) + `\b`
+					triggerRegex, err := regexp.Compile(triggerPattern)
+					if err != nil {
+						log.Printf("Error compiling search trigger regex: %v. Falling back to simple contains.", err)
+						// Fallback or handle error appropriately
+						// For now, let's log and potentially skip regex matching for this part
+						continue // Or use strings.Contains as a fallback
+					}
+
+					for _, partItem := range parts {
+						if partMap, ok := partItem.(map[string]any); ok {
+							if text, ok := partMap["text"].(string); ok {
+								if triggerRegex.MatchString(text) {
+									triggerFound = true
+									log.Printf("Search trigger word '%s' found as whole word in message.", searchTrigger)
+									break // Found in this part, break inner loop
+								}
+							}
+						}
+					}
+				}
+			}
+			if triggerFound {
+				break
+			}
+		}
+	}
+
+	// --- Check for functionDeclarations ---
+	toolsVal, toolsExist := requestData["tools"]
+	if toolsExist {
+		// Check if tools is an array
+		if toolsSlice, ok := toolsVal.([]any); ok {
+			for _, tool := range toolsSlice {
+				if toolMap, ok := tool.(map[string]any); ok {
+					if _, fdExists := toolMap["functionDeclarations"]; fdExists {
+						hasFunctionDeclarations = true
+						log.Println("Found 'functionDeclarations' within tools array.")
+						break // Found it, no need to check further
+					}
+				}
+			}
+		} else if toolsMap, ok := toolsVal.(map[string]any); ok {
+			// Check if tools is a map (less common for function declarations, but handle just in case)
+			if _, fdExists := toolsMap["functionDeclarations"]; fdExists {
+				hasFunctionDeclarations = true
+				log.Println("Found 'functionDeclarations' within tools map.")
+			}
+		}
 	}
 
 	googleSearchTool := map[string]any{
 		"google_search": map[string]any{},
 	}
 
-	// Call addGoogleSearchToTools and capture the returned slice
-	newToolsSlice, modified := addGoogleSearchToTools(requestData, googleSearchTool)
-	if !modified {
-		log.Println("No modification needed for tools.")
-		return bodyBytes, nil // No changes needed
+	// --- Apply modification logic ---
+	if triggerFound {
+		// Force google_search, remove functionDeclarations
+		log.Println("Trigger found: Ensuring 'google_search' tool exists and removing 'functionDeclarations'.")
+
+		// Remove functionDeclarations if they exist within a map structure
+		if toolsExist {
+			if toolsMap, ok := toolsVal.(map[string]any); ok {
+				if hasFunctionDeclarations {
+					delete(toolsMap, "functionDeclarations")
+					log.Println("Removed 'functionDeclarations'.")
+					modified = true // Mark modified as we deleted something
+					// If the map becomes empty after deletion, remove the tools key? Or leave empty map?
+					// Let's leave it potentially empty for now. If it causes issues, we can remove it.
+					// if len(toolsMap) == 0 {
+					// 	delete(requestData, "tools")
+					// }
+				}
+				// Check if google_search is already there (unlikely if FD was present, but check anyway)
+				googleSearchAlreadyPresent := false
+				if _, gsExists := toolsMap["google_search"]; gsExists {
+					googleSearchAlreadyPresent = true
+				}
+				if !googleSearchAlreadyPresent {
+					toolsMap["google_search"] = googleSearchTool["google_search"]
+					log.Println("Added 'google_search' to existing tools map.")
+					modified = true
+				}
+				requestData["tools"] = toolsMap // Ensure the map is updated
+			} else if _, ok := toolsVal.([]any); ok {
+				// Tools is an array. Replace it entirely with just google_search.
+				log.Println("Replacing existing tools array with just 'google_search'.")
+				requestData["tools"] = []any{googleSearchTool}
+				modified = true
+			} else {
+				// Tools is some other type, overwrite it.
+				log.Printf("Overwriting existing 'tools' field (type %T) with 'google_search'.", toolsVal)
+				requestData["tools"] = []any{googleSearchTool}
+				modified = true
+			}
+		} else {
+			// Tools field doesn't exist, create it with google_search
+			log.Println("Creating 'tools' field with 'google_search'.")
+			requestData["tools"] = []any{googleSearchTool}
+			modified = true
+		}
+
+	} else {
+		// No trigger word found
+		if hasFunctionDeclarations {
+			// FunctionDeclarations exist, do nothing regarding tools
+			log.Println("No trigger found and 'functionDeclarations' present. No tool modification needed.")
+			// modified remains false
+		} else {
+			// No FunctionDeclarations, add google_search if not already present
+			log.Println("No trigger found and no 'functionDeclarations'. Ensuring 'google_search' tool exists.")
+			if toolsExist {
+				googleSearchAlreadyPresent := false
+				// Check if it's an array
+				if toolsSlice, ok := toolsVal.([]any); ok {
+					for _, tool := range toolsSlice {
+						if toolMap, ok := tool.(map[string]any); ok {
+							if _, exists := toolMap["google_search"]; exists {
+								googleSearchAlreadyPresent = true
+								break
+							}
+						}
+					}
+					if !googleSearchAlreadyPresent {
+						log.Println("Appending 'google_search' to existing tools array.")
+						requestData["tools"] = append(toolsSlice, googleSearchTool)
+						modified = true
+					} else {
+						log.Println("'google_search' tool already present in tools array.")
+					}
+				} else if toolsMap, ok := toolsVal.(map[string]any); ok {
+					// Tools is a map, add google_search if not present
+					if _, gsExists := toolsMap["google_search"]; !gsExists {
+						log.Println("Adding 'google_search' to existing tools map.")
+						toolsMap["google_search"] = googleSearchTool["google_search"]
+						requestData["tools"] = toolsMap // Update the map
+						modified = true
+					} else {
+						log.Println("'google_search' tool already present in tools map.")
+					}
+				} else {
+					// Tools is some other type, overwrite it.
+					log.Printf("Overwriting existing 'tools' field (type %T) with 'google_search'.", toolsVal)
+					requestData["tools"] = []any{googleSearchTool}
+					modified = true
+				}
+			} else {
+				// Tools field doesn't exist, create it
+				log.Println("Creating 'tools' field with 'google_search'.")
+				requestData["tools"] = []any{googleSearchTool}
+				modified = true
+			}
+		}
 	}
 
-	// If modified, we need to ensure requestData["tools"] is correctly set.
-	// Check if the 'tools' field in the original data was NOT the map structure
-	// that gets modified in place by addGoogleSearchToTools.
-	if toolsVal, ok := requestData["tools"]; ok {
-		if _, isMap := toolsVal.(map[string]any); !isMap {
-			// If 'tools' existed but wasn't the map structure (i.e., it was a direct array),
-			// update it with the new slice returned by the function.
-			log.Println("Updating existing 'tools' array.")
-			requestData["tools"] = newToolsSlice
-		}
-		// If it *was* the map structure, addGoogleSearchToTools modified it in place,
-		// so no assignment is needed here. The log inside addGoogleSearchToTools covers this.
-	} else {
-		// If 'tools' field didn't exist originally, assign the new slice.
-		log.Println("Assigning newly created 'tools' field.")
-		requestData["tools"] = newToolsSlice
+	// --- Marshal back to JSON if modified ---
+	if !modified {
+		log.Println("Request body not modified.")
+		return bodyBytes, nil // Return original if no changes
 	}
 
 	modifiedBodyBytes, err := json.Marshal(requestData)
 	if err != nil {
-		// It's generally better to return the error here so the caller knows marshaling failed.
+		// Return error, let handlePostBody decide how to handle marshal failure
 		return nil, fmt.Errorf("failed to marshal modified request body: %w", err)
 	}
 
@@ -174,80 +326,9 @@ func modifyBodyWithGoogleSearch(bodyBytes []byte) ([]byte, error) {
 	return modifiedBodyBytes, nil
 }
 
-// addGoogleSearchToTools handles the addition of Google Search tool to the tools section.
-func addGoogleSearchToTools(requestData map[string]any, googleSearchTool map[string]any) ([]any, bool) {
-	var toolsSlice []any
-	googleSearchFound := false
-
-	if toolsVal, ok := requestData["tools"]; ok {
-		// Handle array format (direct tools array)
-		if slice, ok := toolsVal.([]any); ok {
-			toolsSlice = slice
-			for _, tool := range toolsSlice {
-				if toolMap, ok := tool.(map[string]any); ok {
-					if _, exists := toolMap["google_search"]; exists {
-						googleSearchFound = true
-						log.Println("'google_search' tool already present in request.")
-						break
-					}
-				}
-			}
-		} else if toolsMap, ok := toolsVal.(map[string]any); ok {
-			// Handle object format with functionDeclarations
-			if declarations, ok := toolsMap["functionDeclarations"].([]any); ok {
-				toolsSlice = declarations
-				for _, decl := range declarations {
-					if declMap, ok := decl.(map[string]any); ok {
-						if name, ok := declMap["name"].(string); ok && name == "google_search" {
-							googleSearchFound = true
-							log.Println("'google_search' tool already present in request.")
-							break
-						}
-					}
-				}
-
-				// If we need to add the tool and not found
-				if !googleSearchFound {
-					log.Println("Adding 'google_search' to existing functionDeclarations.")
-					// Convert our google_search tool to a functionDeclaration format
-					googleSearchDecl := map[string]any{
-						"name":        "google_search",
-						"description": "Search Google for real-time information",
-						"parameters": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"query": map[string]any{
-									"type":        "string",
-									"description": "The search query",
-								},
-							},
-							"required": []string{"query"},
-						},
-					}
-					toolsMap["functionDeclarations"] = append(declarations, googleSearchDecl)
-					return toolsSlice, true // We return the original slice, but the modification is in the map
-				}
-				return toolsSlice, false
-			}
-		}
-	}
-
-	if googleSearchFound {
-		return toolsSlice, false
-	}
-
-	if toolsSlice == nil {
-		log.Println("Creating 'tools' field with 'google_search'.")
-		return []any{googleSearchTool}, true
-	}
-
-	log.Println("Appending 'google_search' tool to existing tools.")
-	return append(toolsSlice, googleSearchTool), true
-}
-
 // createMainHandler returns the main HTTP handler function.
 // It logs requests, handles CORS, optionally modifies POST bodies, and forwards requests to the proxy.
-func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool) http.HandlerFunc {
+func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool, searchTrigger string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request: %s %s%s", r.Method, r.Host, r.URL.RequestURI())
 
@@ -263,10 +344,10 @@ func createMainHandler(proxy *httputil.ReverseProxy, addGoogleSearch bool) http.
 
 		// Process POST request body if present
 		if r.Method == http.MethodPost && r.Body != nil {
-			modifiedBody, err := handlePostBody(r.Body, addGoogleSearch)
+			modifiedBody, err := handlePostBody(r.Body, addGoogleSearch, searchTrigger)
 			if err != nil {
-				log.Printf("Error reading request body: %v", err)
-				http.Error(w, "Error reading request body", http.StatusInternalServerError)
+				log.Printf("Error processing request body: %v", err)
+				http.Error(w, "Error processing request body", http.StatusInternalServerError)
 				return
 			}
 

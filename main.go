@@ -18,7 +18,8 @@ func main() {
 	keysRaw := flag.String("keys", os.Getenv("GEMINI_API_KEYS"), "Comma-separated list of API keys (required)")
 	removalDuration := flag.Duration("removal-duration", 1*time.Hour, "Duration to remove a failing key from rotation")
 	overrideKeyParam := flag.String("key-param", "key", "The name of the query parameter containing the API key to override")
-	addGoogleSearch := flag.Bool("add-google-search", true, "Automatically add google_search tool if missing in POST requests")
+	addGoogleSearch := flag.Bool("add-google-search", true, "Automatically add google_search tool based on conditions")
+	searchTrigger := flag.String("search-trigger", "search", "Word in user message that forces google_search and removes functionDeclarations")
 
 	flag.Parse()
 
@@ -66,10 +67,13 @@ func main() {
 	log.Printf("Forwarding requests to %s", targetURL.String())
 	log.Printf("Overriding query parameter '%s'", *overrideKeyParam)
 	log.Printf("Key removal duration on failure: %s", *removalDuration)
-	log.Printf("Add google_search tool if missing: %t", *addGoogleSearch)
+	log.Printf("Add google_search tool conditionally: %t", *addGoogleSearch)
+	if *addGoogleSearch {
+		log.Printf("Search trigger word: '%s'", *searchTrigger)
+	}
 
 	// --- Register Handler ---
-	http.HandleFunc("/", createMainHandler(proxy, *addGoogleSearch))
+	http.HandleFunc("/", createMainHandler(proxy, *addGoogleSearch, *searchTrigger))
 
 	// --- Run Server ---
 	if err := http.ListenAndServe(*listenAddr, nil); err != nil {
