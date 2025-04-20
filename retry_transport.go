@@ -112,9 +112,8 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		// --- Apply Authentication ---
 		useHeaderAuth := false
-		for _, prefix := range rt.headerAuthPaths {
-			// Use currentReq.URL.Path which comes from the original request
-			if strings.HasPrefix(currentReq.URL.Path, prefix) {
+		for _, path := range rt.headerAuthPaths {
+			if strings.Contains(currentReq.URL.Path, path) {
 				useHeaderAuth = true
 				break
 			}
@@ -122,11 +121,11 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		query := currentReq.URL.Query() // Get query parameters from the cloned request's URL
 		if useHeaderAuth {
-			// log.Printf("[Retry Transport Attempt %d] Using Authorization header for path: %s (Key Index: %d)", attempt+1, currentReq.URL.Path, keyIndex)
+			log.Printf("[Retry Transport Attempt %d] Using Authorization header for path: %s (Key Index: %d)", attempt+1, currentReq.URL.Path, keyIndex)
 			currentReq.Header.Set("Authorization", "Bearer "+apiKey)
 			query.Del(rt.keyParam) // Remove query param if it exists
 		} else {
-			// log.Printf("[Retry Transport Attempt %d] Using query parameter '%s' for path: %s (Key Index: %d)", attempt+1, rt.keyParam, currentReq.URL.Path, keyIndex)
+			log.Printf("[Retry Transport Attempt %d] Using query parameter '%s' for path: %s (Key Index: %d)", attempt+1, rt.keyParam, currentReq.URL.Path, keyIndex)
 			currentReq.Header.Del("Authorization") // Ensure Authorization header is removed
 			query.Set(rt.keyParam, apiKey)
 		}
