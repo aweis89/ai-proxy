@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // createProxyDirector returns a function that modifies the request before forwarding.
@@ -34,18 +35,18 @@ func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyPara
 		fmt.Printf("Existing Authorization header: %s\n", existingHeader)
 		fmt.Printf("Existing URL: %s\n", req.URL.String())
 
-		if existingHeader != "" {
-			// Set the Authorization header, replacing any existing one. Assuming Bearer token format.
+		useHeader := "/v1beta/openai"
+
+		if strings.Contains(req.URL.Path, useHeader) {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 			fmt.Printf("Authorization header set to: %s\n", req.Header.Get("Authorization"))
 		} else {
-			// if req.URL.Query().Get(overrideKeyParam) != "" {
+			req.Header.Del("Authorization")
 			query := req.URL.Query()
 			query.Set(overrideKeyParam, apiKey)
 			req.URL.RawQuery = query.Encode()
 			log.Printf("Outgoing request URL with key: %s\n", req.URL.String())
 		}
-		// }
 
 		log.Println("--- Outgoing Request Headers ---")
 		for name, values := range req.Header {
