@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"errors" // Added errors import
 	"io"
 	"log"
 	"net/http"
@@ -11,109 +11,60 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
-	"strings"
 )
 
 // createProxyDirector returns a function that modifies the request before forwarding.
-// It selects an API key, sets it based on path configuration (header or query param), and handles key retrieval errors.
-func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyParam string, headerAuthPaths []string, originalDirector func(*http.Request)) func(*http.Request) {
+// With the retryTransport handling key selection and auth, this director is simplified.
+// It primarily ensures the default director logic (setting scheme, host, path) runs
+// and sets the Host header correctly.
+func createProxyDirector(targetURL *url.URL, originalDirector func(*http.Request)) func(*http.Request) {
 	return func(req *http.Request) {
-		originalDirector(req) // Run the default director first
+		// Run the original director provided by NewSingleHostReverseProxy
+		// This sets req.URL.Scheme, req.URL.Host, and potentially req.URL.Path
+		originalDirector(req)
 
-		apiKey, keyIndex, err := keyMan.getNextKey()
-		if err != nil {
-			log.Printf("Director Error: Could not get next key: %v", err)
-			// Add error to context for ErrorHandler
-			*req = *req.WithContext(context.WithValue(req.Context(), proxyErrorContextKey, err))
-			return
-		}
-
-		log.Printf("Using key index %d for request to %s", keyIndex, req.URL.Path)
-		*req = *req.WithContext(context.WithValue(req.Context(), keyIndexContextKey, keyIndex))
-
-		existingHeader := req.Header.Get("Authorization")
-		fmt.Printf("Existing Authorization header: %s\n", existingHeader) // Keep for debugging if needed
-		fmt.Printf("Existing URL: %s\n", req.URL.String()) // Keep for debugging if needed
-
-		useHeaderAuth := false
-		for _, prefix := range headerAuthPaths {
-			if strings.HasPrefix(req.URL.Path, prefix) {
-				useHeaderAuth = true
-				break
-			}
-		}
-
-		if useHeaderAuth {
-			log.Printf("Using Authorization header for path: %s", req.URL.Path)
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-			// Remove the query param if it exists from original request (optional, but cleaner)
-			query := req.URL.Query()
-			query.Del(overrideKeyParam)
-			req.URL.RawQuery = query.Encode()
-		} else {
-			log.Printf("Using query parameter '%s' for path: %s", overrideKeyParam, req.URL.Path)
-			req.Header.Del("Authorization") // Ensure Authorization header is removed
-			query := req.URL.Query()
-			query.Set(overrideKeyParam, apiKey)
-			req.URL.RawQuery = query.Encode()
-			log.Printf("Outgoing request URL with key: %s\n", req.URL.String())
-		}
-
-		log.Println("--- Outgoing Request Headers ---")
-		for name, values := range req.Header {
-			for _, value := range values {
-				log.Printf("%s: %s", name, value)
-			}
-		}
-		log.Println("------------------------------")
-
+		// Set the Host header to the target host. The retryTransport will handle auth.
 		req.Host = targetURL.Host
+
+		// No key selection or auth logic needed here anymore.
+		// No context modification needed here (retryTransport handles keyIndexContextKey).
+		// Logging of headers can be moved to retryTransport if needed per-attempt.
 	}
 }
 
 // createProxyModifyResponse returns a function that modifies the response from the target.
-// It checks for specific status codes (429, 400, 403) and marks the used key as failed if necessary.
+// It checks for specific status codes and marks the used key as failed if necessary.
+// This is still useful for handling non-retryable errors (like 400 Bad Request)
+// or logging the final outcome. The retryTransport handles marking keys for retryable errors (like 429).
 func createProxyModifyResponse(keyMan *keyManager) func(*http.Response) error {
 	return func(resp *http.Response) error {
+		// Get the key index used in the *last* attempt from the context set by retryTransport.
 		keyIndexVal := resp.Request.Context().Value(keyIndexContextKey)
+		keyIndex, keyIndexOk := keyIndexVal.(int)
 
-		// If no keyIndex was added (e.g., director failed), check for a proxyError
-		if keyIndexVal == nil {
-			proxyErrVal := resp.Request.Context().Value(proxyErrorContextKey)  // Use defined constant
-			if proxyErr, ok := proxyErrVal.(error); ok && proxyErrVal != nil { // Explicit nil check
-				log.Printf("Error occurred during key selection for this request: %v", proxyErr)
-			} else {
-				// Only log warning if there wasn't a proxyError either
-				if proxyErrVal == nil {
-					log.Println("Warning: No key index or proxy error found in request context for ModifyResponse.")
-				}
+		if !keyIndexOk {
+			// This might happen if the request failed before the transport even ran (e.g., context canceled)
+			// or if the transport failed to get a key initially.
+			log.Println("Warning: No key index found in request context for ModifyResponse.")
+			// Log non-2xx status even if key index is missing
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				log.Printf("Received non-2xx status: %d (Key Index Unknown)", resp.StatusCode)
+				// Log body without key context
+				logResponseBody(resp)
 			}
-			return nil // Return early as there's no key index to process
+			return nil // Return early as there's no key index to process further
 		}
 
-		keyIndex, ok := keyIndexVal.(int)
-		if !ok {
-			log.Printf("Error: Invalid key index type in context: %T", keyIndexVal)
-			return nil
-		}
-
-		// Log response body for non-2xx status codes
+		// Log response body for non-2xx status codes, now with key index context
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Printf("Request using key index %d received non-2xx status: %d", keyIndex, resp.StatusCode)
-			bodyBytes, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("Error reading non-2xx response body: %v", err)
-				// Restore empty body if read fails
-				resp.Body = io.NopCloser(bytes.NewBuffer(nil))
-			} else {
-				log.Printf("Non-2xx Response Body (Status %d)", resp.StatusCode)
-				// Restore the body so the client can read it
-				resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-			}
+			log.Printf("Request using key index %d (last attempt) received non-2xx status: %d", keyIndex, resp.StatusCode)
+			logResponseBody(resp) // Use helper to read/restore body
 
-			// Still mark key as failed only for >= 400 status codes
-			if resp.StatusCode >= 400 {
-				log.Printf("Marking key index %d as failing due to status %d.", keyIndex, resp.StatusCode)
+			// Mark key as failed for non-retryable client errors (4xx) that weren't handled by transport.
+			// Transport handles 429. This handles things like 400, 401, 403 etc.
+			// Avoid marking for 5xx here, as transport might retry those, and they aren't key-specific.
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				log.Printf("Marking key index %d as failing due to non-retryable client error status %d.", keyIndex, resp.StatusCode)
 				keyMan.markKeyFailed(keyIndex)
 			}
 		}
@@ -122,26 +73,61 @@ func createProxyModifyResponse(keyMan *keyManager) func(*http.Response) error {
 	}
 }
 
-// createProxyErrorHandler returns a function that handles errors during proxying.
-// It logs the error and returns an appropriate HTTP error status to the client.
+// logResponseBody reads, logs, and restores the response body. Used for error logging.
+func logResponseBody(resp *http.Response) {
+	if resp.Body == nil || resp.Body == http.NoBody {
+		log.Printf("Non-2xx Response (Status %d) had no body.", resp.StatusCode)
+		return
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close() // Close original body reader
+	if err != nil {
+		log.Printf("Error reading non-2xx response body (Status %d): %v", resp.StatusCode, err)
+		// Restore empty body if read fails
+		resp.Body = io.NopCloser(bytes.NewBuffer(nil))
+	} else {
+		// Limit logged body size to avoid flooding logs
+		logLimit := 512
+		bodyString := string(bodyBytes)
+		if len(bodyString) > logLimit {
+			bodyString = bodyString[:logLimit] + "... (truncated)"
+		}
+		log.Printf("Non-2xx Response Body (Status %d): %s", resp.StatusCode, bodyString)
+		// Restore the body so the client can read it
+		resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+}
+
+// createProxyErrorHandler returns a function that handles terminal errors during proxying,
+// typically errors returned by the custom transport after exhausting retries.
 func createProxyErrorHandler() func(http.ResponseWriter, *http.Request, error) {
 	return func(rw http.ResponseWriter, req *http.Request, err error) {
-		log.Printf("Proxy ErrorHandler triggered: %v", err)
+		log.Printf("Proxy ErrorHandler triggered after transport/retries: %v", err)
 
-		proxyErrVal := req.Context().Value(proxyErrorContextKey)
-		if proxyErr, ok := proxyErrVal.(error); ok {
-			http.Error(rw, "Proxy error: "+proxyErr.Error(), http.StatusServiceUnavailable)
-			return
-		}
-
+		// Log key index if available
 		keyIndexVal := req.Context().Value(keyIndexContextKey)
-		if keyIndexVal != nil {
-			if keyIndex, ok := keyIndexVal.(int); ok {
-				log.Printf("Error occurred during request with key index %d: %v", keyIndex, err)
-			}
+		if keyIndex, ok := keyIndexVal.(int); ok {
+			log.Printf("-> Last attempt used key index %d", keyIndex)
+		} else {
+			log.Printf("-> Key index for last attempt not found in context.")
 		}
 
-		http.Error(rw, "Proxy Error: "+err.Error(), http.StatusBadGateway)
+		// Check for specific error types to determine the response status code.
+		var proxyErrWithStatus *proxyErrorWithStatus
+		if errors.As(err, &proxyErrWithStatus) {
+			// Use the status code from the error returned by the transport
+			log.Printf("--> Responding to client with upstream status: %d", proxyErrWithStatus.StatusCode)
+			http.Error(rw, err.Error(), proxyErrWithStatus.StatusCode)
+		} else if errors.Is(err, context.Canceled) {
+			// Client closed the connection
+			log.Printf("--> Responding to client with status: %d (Context Canceled)", http.StatusRequestTimeout)
+			http.Error(rw, "Client connection closed", http.StatusRequestTimeout) // 499 Client Closed Request is common
+		} else {
+			// Generic transport error (connection refused, DNS error, etc.)
+			log.Printf("--> Responding to client with status: %d (Bad Gateway)", http.StatusBadGateway)
+			// Use the message expected by the test for generic upstream failures
+			http.Error(rw, "Proxy Error: Upstream server failed after retries", http.StatusBadGateway) // 502
+		}
 	}
 }
 

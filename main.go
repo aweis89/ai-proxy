@@ -51,7 +51,6 @@ func main() {
 		}
 	}
 
-
 	targetURL, err := url.Parse(*targetHost)
 	if err != nil {
 		log.Fatalf("Error parsing target host URL: %v", err)
@@ -70,9 +69,19 @@ func main() {
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
 	// --- Customize Proxy ---
-	originalDirector := proxy.Director // Save original director
-	proxy.Director = createProxyDirector(keyMan, targetURL, *overrideKeyParam, headerAuthPaths, originalDirector)
-	proxy.ModifyResponse = createProxyModifyResponse(keyMan)
+	// Create the custom transport with retry logic
+	retryTransport := newRetryTransport(http.DefaultTransport, keyMan, *overrideKeyParam, headerAuthPaths)
+	proxy.Transport = retryTransport
+
+	// Simplify the Director: It only needs to set the host/scheme via the original director.
+	// Key selection and auth are now handled by the retryTransport.
+	originalDirector := proxy.Director                                // Save original director from NewSingleHostReverseProxy
+	proxy.Director = createProxyDirector(targetURL, originalDirector) // Pass only necessary args
+
+	// ModifyResponse can still be used for logging or handling non-retryable errors detected after response.
+	proxy.ModifyResponse = createProxyModifyResponse(keyMan) // Keep keyMan for now for non-retry 4xx
+
+	// ErrorHandler handles terminal errors after retries are exhausted by the transport.
 	proxy.ErrorHandler = createProxyErrorHandler()
 
 	// --- Start HTTP Server ---

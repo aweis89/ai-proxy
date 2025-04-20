@@ -32,170 +32,45 @@ func assertNotNil(t *testing.T, val interface{}, msgAndArgs ...interface{}) {
 	}
 }
 
-// --- Test createProxyDirector ---
-
-func TestCreateProxyDirector_AddsKeyToQueryAndRotates(t *testing.T) {
-	keys := []string{"key1", "key2", "key3"}
-	km, _ := newKeyManager(keys, 5*time.Minute)
-	targetURL, _ := url.Parse("http://example.com")
-	keyParam := "api_key"
-	originalDirector := func(req *http.Request) {
-		req.URL.Scheme = targetURL.Scheme
-		req.URL.Host = targetURL.Host
-		// Path changes per request in loop
-	}
-	// Test with paths that should use query params (not matching header paths)
-	headerPaths := []string{"/openai/", "/v1/special"}
-	director := createProxyDirector(km, targetURL, keyParam, headerPaths, originalDirector)
-
-	usedIndices := make(map[int]bool)
-	numRequests := len(keys) * 3 // Make enough requests to likely see rotation
-
-	for i := 0; i < numRequests; i++ {
-		path := fmt.Sprintf("/test%d", i)
-		req := httptest.NewRequest("GET", path, nil)
-		// Manually set path in director for test request
-		originalDirector(req)
-		req.URL.Path = path
-
-		director(req)
-
-		// Check key is added to query param
-		usedKey := req.URL.Query().Get(keyParam)
-		authHeader := req.Header.Get("Authorization")
-		keyIndexVal := req.Context().Value(keyIndexContextKey)
-		assertNotNil(t, keyIndexVal, "key index should be in context for request %d", i)
-		keyIndex := keyIndexVal.(int)
-
-		if keyIndex < 0 || keyIndex >= len(keys) {
-			t.Fatalf("Request %d: Invalid key index %d returned", i, keyIndex)
-		}
-		if usedKey != keys[keyIndex] {
-			t.Errorf("Request %d: Expected key %q in query param %q, got %q for index %d", i, keys[keyIndex], keyParam, usedKey, keyIndex)
-		}
-		if authHeader != "" {
-			t.Errorf("Request %d: Expected Authorization header to be empty, got %q", i, authHeader)
-		}
-		assertString(t, req.URL.Scheme, "http")
-		assertString(t, req.URL.Host, "example.com")
-		assertString(t, req.Host, "example.com")
-
-		usedIndices[keyIndex] = true
-	}
-
-	// Check if multiple keys were used (highly likely with len*3 requests)
-	if len(keys) > 1 && len(usedIndices) < 2 {
-		t.Errorf("Expected at least 2 different key indices to be used over %d requests, only got %d unique indices (%v)", numRequests, len(usedIndices), usedIndices)
-	}
-}
-
-func TestCreateProxyDirector_UsesAuthorizationHeader(t *testing.T) {
-	keys := []string{"auth_key1"}
-	km, _ := newKeyManager(keys, 5*time.Minute)
-	targetURL, _ := url.Parse("http://example.com")
-	keyParam := "api_key" // Should not be used
-	testPath := "/openai/v1/chat/completions" // Use a path that triggers header auth
-	originalDirector := func(req *http.Request) {
-		req.URL.Scheme = targetURL.Scheme
-		req.URL.Host = targetURL.Host
-		req.URL.Path = testPath // Set the correct path
-	}
-	// Ensure the test path matches one of the configured header paths
-	headerPaths := []string{"/openai/", "/v1/special"}
-	director := createProxyDirector(km, targetURL, keyParam, headerPaths, originalDirector)
-
-	req := httptest.NewRequest("GET", testPath, nil) // Use the correct path (/openai/v1/chat/completions)
-	req.Header.Set("Authorization", "Bearer old_token") // Set an existing header
-	director(req)
-
-	// Check Authorization header is updated
-	authHeader := req.Header.Get("Authorization")
-	assertString(t, authHeader, "Bearer auth_key1")
-
-	// Check query parameter is NOT set
-	queryKey := req.URL.Query().Get(keyParam)
-	assertString(t, queryKey, "")
-
-	keyIndexVal := req.Context().Value(keyIndexContextKey)
-	assertNotNil(t, keyIndexVal, "key index should be in context")
-	assertInt(t, keyIndexVal.(int), 0)
-	assertString(t, req.Host, "example.com")
-}
-
-func TestCreateProxyDirector_NoKeysAvailable(t *testing.T) {
-	// Use a key manager deliberately configured to have no keys initially
-	// (Though newKeyManager prevents this, we test the director's handling)
-	km := &keyManager{
-		keys:            []string{},
-		availableKeys:   map[int]string{},
-		failingKeys:     map[int]time.Time{},
-		removalDuration: 1 * time.Minute,
-	}
-	targetURL, _ := url.Parse("http://example.com")
-	keyParam := "api_key"
-	originalDirector := func(req *http.Request) {} // Simple original director
-	headerPaths := []string{"/openai/"} // Doesn't matter for this test
-	director := createProxyDirector(km, targetURL, keyParam, headerPaths, originalDirector)
-
-	req := httptest.NewRequest("GET", "/test", nil) // Path doesn't matter here
-	director(req)
-
-	// Check if error is added to context
-	errVal := req.Context().Value(proxyErrorContextKey)
-	assertNotNil(t, errVal, "Error should be in context when no keys are available")
-	err, ok := errVal.(error)
-	if !ok {
-		t.Fatalf("Expected error in context, got %T", errVal)
-	}
-	// The specific error comes from keyManager.getNextKey
-	assertError(t, err, errors.New("internal error: key list is empty"))
-
-	// Check that key was NOT added
-	queryKey := req.URL.Query().Get(keyParam)
-	assertString(t, queryKey, "")
-	authHeader := req.Header.Get("Authorization")
-	assertString(t, authHeader, "")
-}
-
 // --- Test createProxyModifyResponse ---
 
-func TestCreateProxyModifyResponse_MarksKeyFailedOn4xx(t *testing.T) {
+// Test that ModifyResponse marks keys as failed for non-retryable 4xx errors.
+// Note: 429 is handled by the retryTransport, so we test other 4xx codes here.
+func TestCreateProxyModifyResponse_MarksKeyFailedOnNonRetryable4xx(t *testing.T) {
 	keys := []string{"key1", "key2"}
 	km, _ := newKeyManager(keys, 5*time.Minute)
 	modifier := createProxyModifyResponse(km)
 
-	// Simulate key 0 was used for this request
-	ctx := context.WithValue(context.Background(), keyIndexContextKey, 0)
-	req := httptest.NewRequest("GET", "/", nil).WithContext(ctx)
-	resp := &http.Response{
-		StatusCode: http.StatusTooManyRequests, // 429
-		Request:    req,
-		Body:       io.NopCloser(strings.NewReader("Error details")), // Add a body
+	// Simulate key 0 was used for a 400 Bad Request
+	ctx0 := context.WithValue(context.Background(), keyIndexContextKey, 0)
+	req0 := httptest.NewRequest("POST", "/", nil).WithContext(ctx0)
+	resp0 := &http.Response{
+		StatusCode: http.StatusBadRequest, // 400
+		Request:    req0,
+		Body:       io.NopCloser(strings.NewReader("Bad input")),
 	}
-
-	err := modifier(resp)
+	err := modifier(resp0)
 	assertNoError(t, err)
 
-	// Check if key 0 is now failing
 	km.mu.Lock()
-	_, isAvailable := km.availableKeys[0]
-	_, isFailing := km.failingKeys[0]
+	_, isAvailable0 := km.availableKeys[0]
+	_, isFailing0 := km.failingKeys[0]
 	km.mu.Unlock()
 
-	if isAvailable {
-		t.Error("Expected key 0 to be removed from available keys, but it was found")
+	if isAvailable0 {
+		t.Error("Expected key 0 to be removed from available keys for 400")
 	}
-	if !isFailing {
-		t.Error("Expected key 0 to be added to failing keys, but it was not found")
+	if !isFailing0 {
+		t.Error("Expected key 0 to be added to failing keys for 400")
 	}
 
-	// Simulate key 1 was used for a 400 Bad Request
+	// Simulate key 1 was used for a 403 Forbidden
 	ctx1 := context.WithValue(context.Background(), keyIndexContextKey, 1)
-	req1 := httptest.NewRequest("POST", "/", nil).WithContext(ctx1)
+	req1 := httptest.NewRequest("GET", "/forbidden", nil).WithContext(ctx1)
 	resp1 := &http.Response{
-		StatusCode: http.StatusBadRequest, // 400
+		StatusCode: http.StatusForbidden, // 403
 		Request:    req1,
-		Body:       io.NopCloser(strings.NewReader("Bad input")),
+		Body:       io.NopCloser(strings.NewReader("Access denied")),
 	}
 	err = modifier(resp1)
 	assertNoError(t, err)
@@ -206,10 +81,10 @@ func TestCreateProxyModifyResponse_MarksKeyFailedOn4xx(t *testing.T) {
 	km.mu.Unlock()
 
 	if isAvailable1 {
-		t.Error("Expected key 1 to be removed from available keys")
+		t.Error("Expected key 1 to be removed from available keys for 403")
 	}
 	if !isFailing1 {
-		t.Error("Expected key 1 to be added to failing keys")
+		t.Error("Expected key 1 to be added to failing keys for 403")
 	}
 
 	// Check that both keys are now failing
@@ -218,17 +93,20 @@ func TestCreateProxyModifyResponse_MarksKeyFailedOn4xx(t *testing.T) {
 	assertInt(t, len(km.failingKeys), 2)
 	km.mu.Unlock()
 
-	// Ensure response body is still readable after being logged (important!)
-	bodyBytes, readErr := io.ReadAll(resp.Body)
-	assertNoError(t, readErr)
-	assertString(t, string(bodyBytes), "Error details")
+	// Ensure response bodies are still readable after being logged
+	bodyBytes0, readErr0 := io.ReadAll(resp0.Body)
+	assertNoError(t, readErr0)
+	assertString(t, string(bodyBytes0), "Bad input")
 
 	bodyBytes1, readErr1 := io.ReadAll(resp1.Body)
 	assertNoError(t, readErr1)
-	assertString(t, string(bodyBytes1), "Bad input")
+	assertString(t, string(bodyBytes1), "Access denied")
 }
 
-func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOn2xx(t *testing.T) {
+// Test that ModifyResponse does NOT mark keys as failed for 2xx or 5xx status codes.
+// 5xx might be retried by the transport, and 2xx are successes.
+// 429 is also handled by transport, so it shouldn't be marked here either.
+func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOnSuccessOrRetryable(t *testing.T) {
 	keys := []string{"key1"}
 	km, _ := newKeyManager(keys, 5*time.Minute)
 	modifier := createProxyModifyResponse(km)
@@ -261,8 +139,51 @@ func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOn2xx(t *testing.T) {
 	bodyBytes, readErr := io.ReadAll(resp.Body)
 	assertNoError(t, readErr)
 	assertString(t, string(bodyBytes), "Success")
+
+	// Test 500 Internal Server Error
+	ctx500 := context.WithValue(context.Background(), keyIndexContextKey, 0)
+	req500 := httptest.NewRequest("GET", "/", nil).WithContext(ctx500)
+	resp500 := &http.Response{
+		StatusCode: http.StatusInternalServerError, // 500
+		Request:    req500,
+		Body:       io.NopCloser(strings.NewReader("Server Error")),
+	}
+	err = modifier(resp500)
+	assertNoError(t, err)
+	km.mu.Lock()
+	_, isAvailable500 := km.availableKeys[0]
+	_, isFailing500 := km.failingKeys[0]
+	km.mu.Unlock()
+	if !isAvailable500 {
+		t.Error("Expected key 0 to still be available after 500")
+	}
+	if isFailing500 {
+		t.Error("Expected key 0 not to be failing after 500")
+	}
+
+	// Test 429 Too Many Requests (should be handled by transport, not marked here)
+	ctx429 := context.WithValue(context.Background(), keyIndexContextKey, 0)
+	req429 := httptest.NewRequest("GET", "/", nil).WithContext(ctx429)
+	resp429 := &http.Response{
+		StatusCode: http.StatusTooManyRequests, // 429
+		Request:    req429,
+		Body:       io.NopCloser(strings.NewReader("Rate Limited")),
+	}
+	err = modifier(resp429)
+	assertNoError(t, err)
+	km.mu.Lock()
+	_, isAvailable429 := km.availableKeys[0]
+	_, isFailing429 := km.failingKeys[0]
+	km.mu.Unlock()
+	if !isAvailable429 {
+		t.Error("Expected key 0 to still be available after 429 (handled by transport)")
+	}
+	if isFailing429 {
+		t.Error("Expected key 0 not to be failing after 429 (handled by transport)")
+	}
 }
 
+// Test resilience when key index is missing from context (shouldn't happen normally with transport)
 func TestCreateProxyModifyResponse_HandlesMissingKeyIndex(t *testing.T) {
 	// This shouldn't happen in normal operation if director ran, but test resilience
 	keys := []string{"key1"}
@@ -299,85 +220,15 @@ func TestCreateProxyModifyResponse_HandlesMissingKeyIndex(t *testing.T) {
 
 	// Check log output for warning
 	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "Warning: No key index or proxy error found") {
-		t.Errorf("Expected log warning about missing key index and proxy error, got: %s", logOutput)
-	}
-}
-
-func TestCreateProxyModifyResponse_HandlesProxyErrorInContext(t *testing.T) {
-	// Simulate a case where the director failed to get a key and put an error in context
-	keys := []string{"key1"}
-	km, _ := newKeyManager(keys, 5*time.Minute)
-	modifier := createProxyModifyResponse(km)
-
-	proxyErr := errors.New("director failed")
-	// CRITICAL: Ensure only proxyErrorContextKey is set, not keyIndexContextKey,
-	// to simulate the director failing *before* selecting a key.
-	ctx := context.WithValue(context.Background(), proxyErrorContextKey, proxyErr)
-	req := httptest.NewRequest("GET", "/", nil).WithContext(ctx)
-	resp := &http.Response{
-		StatusCode: http.StatusServiceUnavailable, // Status code might reflect the proxy error
-		Request:    req,
-		Body:       io.NopCloser(strings.NewReader("Proxy level error occurred")),
-	}
-
-	// Capture log output
-	var logBuf bytes.Buffer
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(os.Stderr)
-
-	err := modifier(resp)
-	assertNoError(t, err) // Modifier itself shouldn't error
-
-	// Check key 0 was NOT marked as failed, as no key index should have been involved
-	km.mu.Lock()
-	_, isAvailable := km.availableKeys[0]
-	_, isFailing := km.failingKeys[0]
-	km.mu.Unlock()
-
-	if !isAvailable {
-		t.Error("Expected key 0 to still be available when proxyError is in context and no keyIndex")
-	}
-	if isFailing {
-		t.Error("Expected key 0 not to be failing when proxyError is in context and no keyIndex")
-	}
-
-	// Check log output for the proxy error message from the context
-	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "Error occurred during key selection for this request: director failed") {
-		t.Errorf("Expected log message about proxyError from context, got: %s", logOutput)
+	// The specific check for "proxy error" is removed as director no longer sets it.
+	if !strings.Contains(logOutput, "Warning: No key index found in request context") {
+		t.Errorf("Expected log warning about missing key index, got: %s", logOutput)
 	}
 }
 
 // --- Test createProxyErrorHandler ---
 
-func TestCreateProxyErrorHandler_HandlesContextError(t *testing.T) {
-	handler := createProxyErrorHandler()
-	proxyErr := errors.New("no keys available")
-	ctx := context.WithValue(context.Background(), proxyErrorContextKey, proxyErr)
-	req := httptest.NewRequest("GET", "/", nil).WithContext(ctx)
-	rr := httptest.NewRecorder()
-
-	// Capture log output
-	var logBuf bytes.Buffer
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(os.Stderr)
-
-	handler(rr, req, errors.New("some other transport error")) // Simulate a different error passed by proxy
-
-	resp := rr.Result()
-	body, _ := io.ReadAll(resp.Body)
-
-	assertInt(t, resp.StatusCode, http.StatusServiceUnavailable)
-	assertString(t, strings.TrimSpace(string(body)), "Proxy error: "+proxyErr.Error())
-
-	// Check log output includes the original transport error
-	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "Proxy ErrorHandler triggered: some other transport error") {
-		t.Errorf("Expected log message with original transport error, got: %s", logOutput)
-	}
-}
-
+// Test the error handler when a generic error is passed (simulating transport failure after retries)
 func TestCreateProxyErrorHandler_HandlesGenericError(t *testing.T) {
 	handler := createProxyErrorHandler()
 	req := httptest.NewRequest("GET", "/", nil) // No specific proxy error in context
@@ -398,29 +249,76 @@ func TestCreateProxyErrorHandler_HandlesGenericError(t *testing.T) {
 	resp := rr.Result()
 	body, _ := io.ReadAll(resp.Body)
 
-	assertInt(t, resp.StatusCode, http.StatusBadGateway)
-	assertString(t, strings.TrimSpace(string(body)), "Proxy Error: "+genericErr.Error())
+	assertInt(t, resp.StatusCode, http.StatusBadGateway) // Should return 502
+	assertString(t, strings.TrimSpace(string(body)), "Proxy Error: Upstream server failed after retries") // Check updated message
 
 	// Check log output includes the generic error and key index
 	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "Proxy ErrorHandler triggered: connection refused") {
-		t.Errorf("Expected log message with generic error, got: %s", logOutput)
+	if !strings.Contains(logOutput, "Proxy ErrorHandler triggered after transport/retries: connection refused") {
+		t.Errorf("Expected log message indicating handler trigger and error, got: %s", logOutput)
 	}
-	if !strings.Contains(logOutput, "Error occurred during request with key index 5: connection refused") {
-		t.Errorf("Expected log message with key index info, got: %s", logOutput)
+	if !strings.Contains(logOutput, "-> Last attempt used key index 5") {
+		t.Errorf("Expected log message indicating last key index used, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "--> Responding to client with status: 502") {
+		t.Errorf("Expected log message indicating response status 502, got: %s", logOutput)
+	}
+}
+
+// Test the error handler when the error is context.Canceled
+func TestCreateProxyErrorHandler_HandlesContextCanceled(t *testing.T) {
+	handler := createProxyErrorHandler()
+	req := httptest.NewRequest("GET", "/", nil)
+	rr := httptest.NewRecorder()
+	// Use context.DeadlineExceeded for a clearer timeout scenario, though Canceled is also common
+	// Let's stick with Canceled as that's what the handler checks for explicitly.
+	cancelErr := context.Canceled
+
+	// Capture log output
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	handler(rr, req, cancelErr)
+
+	resp := rr.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	// The handler uses http.StatusRequestTimeout (408) for context.Canceled.
+	assertInt(t, resp.StatusCode, http.StatusRequestTimeout) // 408
+	assertString(t, strings.TrimSpace(string(body)), "Client connection closed")
+
+	// Check log output
+	logOutput := logBuf.String()
+	expectedTriggerMsg := fmt.Sprintf("Proxy ErrorHandler triggered after transport/retries: %v", cancelErr)
+	if !strings.Contains(logOutput, expectedTriggerMsg) {
+		t.Errorf("Expected log message indicating handler trigger and cancel error, got: %s", logOutput)
+	}
+	// Key index won't be present if context is canceled early
+	if !strings.Contains(logOutput, "-> Key index for last attempt not found in context.") {
+		t.Errorf("Expected log message about missing key index for canceled context, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, fmt.Sprintf("--> Responding to client with status: %d", http.StatusRequestTimeout)) {
+		t.Errorf("Expected log message indicating response status %d, got: %s", http.StatusRequestTimeout, logOutput)
 	}
 }
 
 // --- Test createMainHandler (Basic Tests) ---
 
-// Helper to create a minimal proxy for handler tests
-// Helper to create a minimal proxy for handler tests
-// Allows specifying header paths for director configuration
-func newTestProxy(targetServer *httptest.Server, keyMan *keyManager, headerAuthPaths []string) *httputil.ReverseProxy {
+// Helper to create a minimal proxy for handler tests, including the retryTransport.
+func newTestProxy(targetServer *httptest.Server, keyMan *keyManager, keyParam string, headerAuthPaths []string) *httputil.ReverseProxy {
 	targetURL, _ := url.Parse(targetServer.URL)
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	// Setup transport
+	retryTransport := newRetryTransport(http.DefaultTransport, keyMan, keyParam, headerAuthPaths)
+	proxy.Transport = retryTransport
+
+	// Setup simplified director
 	originalDirector := proxy.Director
-	proxy.Director = createProxyDirector(keyMan, targetURL, "key", headerAuthPaths, originalDirector)
+	proxy.Director = createProxyDirector(targetURL, originalDirector) // Simplified call
+
+	// Setup other handlers
 	proxy.ModifyResponse = createProxyModifyResponse(keyMan)
 	proxy.ErrorHandler = createProxyErrorHandler()
 	return proxy
@@ -435,11 +333,12 @@ func TestCreateMainHandler_CorsHeaders(t *testing.T) {
 
 	keys := []string{"testkey"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
+	keyParam := "key"
 	headerPaths := []string{"/openai/"} // Example header paths
-	proxy := newTestProxy(targetServer, km, headerPaths)
+	proxy := newTestProxy(targetServer, km, keyParam, headerPaths)
 	mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
 
-	// Test GET request (should use query param)
+	// Test GET request (retryTransport should add key to query param)
 	reqGet := httptest.NewRequest("GET", "http://localhost:8080/some/path", nil)
 	rrGet := httptest.NewRecorder()
 	mainHandler(rrGet, reqGet)
@@ -470,10 +369,13 @@ func TestCreateMainHandler_CorsHeaders(t *testing.T) {
 func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 	var receivedBody string
 	var receivedApiKey string
+	var receivedAuthHeader string
 	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		receivedBody = string(bodyBytes)
-		receivedApiKey = r.URL.Query().Get("key") // Check key received by target
+		// Check how the key was received by the target (set by retryTransport)
+		receivedApiKey = r.URL.Query().Get("key")
+		receivedAuthHeader = r.Header.Get("Authorization")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "Target received POST")
 	}))
@@ -481,36 +383,51 @@ func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 
 	keys := []string{"postkey1"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
-	headerPaths := []string{"/openai/"} // Example header paths
-	proxy := newTestProxy(targetServer, km, headerPaths)
+	keyParam := "key"
+	headerPaths := []string{"/openai/"} // Path that should use header auth
+	proxy := newTestProxy(targetServer, km, keyParam, headerPaths)
 	mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
 
 	postBody := `{"data": "value"}`
-	// Use a path that should use query param
-	req := httptest.NewRequest("POST", "http://localhost:8080/non-gemini/path", strings.NewReader(postBody))
-	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
 
-	mainHandler(rr, req)
+	// --- Test 1: Path NOT matching headerAuthPaths (should use query param) ---
+	req1 := httptest.NewRequest("POST", "http://localhost:8080/non-openai/path", strings.NewReader(postBody))
+	req1.Header.Set("Content-Type", "application/json")
+	rr1 := httptest.NewRecorder()
+	mainHandler(rr1, req1)
 
-	resp := rr.Result()
-	assertInt(t, resp.StatusCode, http.StatusOK)
+	resp1 := rr1.Result()
+	assertInt(t, resp1.StatusCode, http.StatusOK)
 	assertString(t, receivedBody, postBody)
-	assertString(t, receivedApiKey, "postkey1")
+	assertString(t, receivedApiKey, "postkey1") // Key should be in query param
+	assertString(t, receivedAuthHeader, "")     // Auth header should be empty
+	receivedBody, receivedApiKey, receivedAuthHeader = "", "", "" // Reset
+
+	// --- Test 2: Path matching headerAuthPaths (should use Authorization header) ---
+	req2 := httptest.NewRequest("POST", "http://localhost:8080/openai/v1/complete", strings.NewReader(postBody))
+	req2.Header.Set("Content-Type", "application/json")
+	rr2 := httptest.NewRecorder()
+	mainHandler(rr2, req2)
+
+	resp2 := rr2.Result()
+	assertInt(t, resp2.StatusCode, http.StatusOK)
+	assertString(t, receivedBody, postBody)
+	assertString(t, receivedApiKey, "") // Key should NOT be in query param
+	assertString(t, receivedAuthHeader, "Bearer postkey1") // Key should be in header
 }
 
-// --- Test createMainHandler Body Modification (Needs handlePostBody tests first) ---
-// Add tests here later that specifically verify the body modification logic
-// based on addGoogleSearch flag and path matching, using handlePostBody tests as a guide.
+// --- Test createMainHandler Body Modification ---
 
 func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 	var receivedBody string
 	var receivedApiKey string
+	var receivedAuthHeader string // Declare here
 	var receivedContentType string
 	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		receivedBody = string(bodyBytes)
-		receivedApiKey = r.URL.Query().Get("key")
+		receivedApiKey = r.URL.Query().Get("key") // Gemini paths use query param by default
+		receivedAuthHeader = r.Header.Get("Authorization")
 		receivedContentType = r.Header.Get("Content-Type")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "Target received POST")
@@ -519,8 +436,9 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 
 	keys := []string{"geminikey"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
-	headerPaths := []string{"/openai/"} // Example header paths
-	proxy := newTestProxy(targetServer, km, headerPaths)
+	keyParam := "key"
+	headerPaths := []string{"/openai/"} // Gemini paths don't match this
+	proxy := newTestProxy(targetServer, km, keyParam, headerPaths)
 	// Enable google search addition
 	mainHandler := createMainHandler(proxy, true, "") // addGoogleSearch=true
 
@@ -534,12 +452,11 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 
 	resp1 := rr1.Result()
 	assertInt(t, resp1.StatusCode, http.StatusOK)
-	assertString(t, receivedBody, expectedBody1)
-	assertString(t, receivedApiKey, "geminikey")
+	assertString(t, receivedBody, expectedBody1) // Verify modified body
+	assertString(t, receivedApiKey, "geminikey") // Verify key in query param
+	assertString(t, receivedAuthHeader, "")     // Verify header is empty
 	assertString(t, receivedContentType, "application/json")
-	receivedBody = "" // Reset for next test
-	receivedApiKey = ""
-	receivedContentType = ""
+	receivedBody, receivedApiKey, receivedAuthHeader, receivedContentType = "", "", "", "" // Reset
 
 	// Test case 2: Body already contains tools array, trigger word found, should replace with google_search
 	postBody2 := `{"contents": [{"parts":[{"text":"search now"}]}], "tools": [{"some_other_tool":{}}]}`
@@ -552,12 +469,11 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 
 	resp2 := rr2.Result()
 	assertInt(t, resp2.StatusCode, http.StatusOK)
-	assertString(t, receivedBody, expectedBody2)
-	assertString(t, receivedApiKey, "geminikey")
+	assertString(t, receivedBody, expectedBody2) // Verify modified body
+	assertString(t, receivedApiKey, "geminikey") // Verify key in query param
+	assertString(t, receivedAuthHeader, "")     // Verify header is empty
 	assertString(t, receivedContentType, "application/json")
-	receivedBody = "" // Reset
-	receivedApiKey = ""
-	receivedContentType = ""
+	receivedBody, receivedApiKey, receivedAuthHeader, receivedContentType = "", "", "", "" // Reset
 
 	// Test case 3: Non-Gemini path, should NOT be modified
 	mainHandlerNoModify := createMainHandler(proxy, true, "") // Still true, but path won't match
@@ -569,8 +485,9 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 
 	resp3 := rr3.Result()
 	assertInt(t, resp3.StatusCode, http.StatusOK)
-	assertString(t, receivedBody, postBody3)
-	assertString(t, receivedApiKey, "geminikey")
+	assertString(t, receivedBody, postBody3)     // Verify original body
+	assertString(t, receivedApiKey, "geminikey") // Verify key in query param
+	assertString(t, receivedAuthHeader, "")     // Verify header is empty
 	assertString(t, receivedContentType, "application/json")
 }
 
@@ -586,8 +503,9 @@ func TestCreateMainHandler_AddGoogleSearchFalse(t *testing.T) {
 
 	keys := []string{"nokey"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
+	keyParam := "key"
 	headerPaths := []string{"/openai/"} // Example header paths
-	proxy := newTestProxy(targetServer, km, headerPaths)
+	proxy := newTestProxy(targetServer, km, keyParam, headerPaths)
 	mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
 
 	postBody := `{"contents": [{"parts":[{"text":"hello"}]}]}`
