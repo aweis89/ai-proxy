@@ -35,7 +35,7 @@ func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyPara
 		fmt.Printf("Existing Authorization header: %s\n", existingHeader)
 		fmt.Printf("Existing URL: %s\n", req.URL.String())
 
-		useHeader := "/v1beta/openai"
+		useHeader := "/openai"
 
 		if strings.Contains(req.URL.Path, useHeader) {
 			req.Header.Set("Authorization", "Bearer "+apiKey)

@@ -88,14 +88,15 @@ func TestCreateProxyDirector_UsesAuthorizationHeader(t *testing.T) {
 	km, _ := newKeyManager(keys, 5*time.Minute)
 	targetURL, _ := url.Parse("http://example.com")
 	keyParam := "api_key" // Should not be used
+	testPath := "/openai/v1/chat/completions" // Use a path that triggers header auth
 	originalDirector := func(req *http.Request) {
 		req.URL.Scheme = targetURL.Scheme
 		req.URL.Host = targetURL.Host
-		req.URL.Path = "/test"
+		req.URL.Path = testPath // Set the correct path
 	}
 	director := createProxyDirector(km, targetURL, keyParam, originalDirector)
 
-	req := httptest.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest("GET", testPath, nil) // Use the correct path
 	req.Header.Set("Authorization", "Bearer old_token") // Set an existing header
 	director(req)
 
