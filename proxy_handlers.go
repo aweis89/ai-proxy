@@ -38,13 +38,14 @@ func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyPara
 			// Set the Authorization header, replacing any existing one. Assuming Bearer token format.
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 			fmt.Printf("Authorization header set to: %s\n", req.Header.Get("Authorization"))
-		}
-		if req.URL.Query().Get(overrideKeyParam) != "" {
+		} else {
+			// if req.URL.Query().Get(overrideKeyParam) != "" {
 			query := req.URL.Query()
 			query.Set(overrideKeyParam, apiKey)
 			req.URL.RawQuery = query.Encode()
 			log.Printf("Outgoing request URL with key: %s\n", req.URL.String())
 		}
+		// }
 
 		log.Println("--- Outgoing Request Headers ---")
 		for name, values := range req.Header {

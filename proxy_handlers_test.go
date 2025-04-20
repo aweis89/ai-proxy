@@ -113,7 +113,6 @@ func TestCreateProxyDirector_UsesAuthorizationHeader(t *testing.T) {
 	assertString(t, req.Host, "example.com")
 }
 
-
 func TestCreateProxyDirector_NoKeysAvailable(t *testing.T) {
 	// Use a key manager deliberately configured to have no keys initially
 	// (Though newKeyManager prevents this, we test the director's handling)
@@ -219,7 +218,6 @@ func TestCreateProxyModifyResponse_MarksKeyFailedOn4xx(t *testing.T) {
 	assertString(t, string(bodyBytes1), "Bad input")
 }
 
-
 func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOn2xx(t *testing.T) {
 	keys := []string{"key1"}
 	km, _ := newKeyManager(keys, 5*time.Minute)
@@ -296,7 +294,6 @@ func TestCreateProxyModifyResponse_HandlesMissingKeyIndex(t *testing.T) {
 	}
 }
 
-
 func TestCreateProxyModifyResponse_HandlesProxyErrorInContext(t *testing.T) {
 	// Simulate a case where the director failed to get a key and put an error in context
 	keys := []string{"key1"}
@@ -342,7 +339,6 @@ func TestCreateProxyModifyResponse_HandlesProxyErrorInContext(t *testing.T) {
 	}
 }
 
-
 // --- Test createProxyErrorHandler ---
 
 func TestCreateProxyErrorHandler_HandlesContextError(t *testing.T) {
@@ -382,7 +378,6 @@ func TestCreateProxyErrorHandler_HandlesGenericError(t *testing.T) {
 	ctx := context.WithValue(context.Background(), keyIndexContextKey, 5)
 	req = req.WithContext(ctx)
 
-
 	// Capture log output
 	var logBuf bytes.Buffer
 	log.SetOutput(&logBuf)
@@ -417,7 +412,6 @@ func newTestProxy(targetServer *httptest.Server, keyMan *keyManager) *httputil.R
 	proxy.ErrorHandler = createProxyErrorHandler()
 	return proxy
 }
-
 
 func TestCreateMainHandler_CorsHeaders(t *testing.T) {
 	// Setup a dummy target server
@@ -459,7 +453,6 @@ func TestCreateMainHandler_CorsHeaders(t *testing.T) {
 	assertString(t, string(bodyOptions), "")
 }
 
-
 func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 	var receivedBody string
 	var receivedApiKey string
@@ -495,100 +488,97 @@ func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 // based on addGoogleSearch flag and path matching, using handlePostBody tests as a guide.
 
 func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
-    var receivedBody string
-    var receivedApiKey string
-    var receivedContentType string
-    targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        bodyBytes, _ := io.ReadAll(r.Body)
-        receivedBody = string(bodyBytes)
-        receivedApiKey = r.URL.Query().Get("key")
-        receivedContentType = r.Header.Get("Content-Type")
-        w.WriteHeader(http.StatusOK)
-        fmt.Fprintln(w, "Target received POST")
-    }))
-    defer targetServer.Close()
+	var receivedBody string
+	var receivedApiKey string
+	var receivedContentType string
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		receivedBody = string(bodyBytes)
+		receivedApiKey = r.URL.Query().Get("key")
+		receivedContentType = r.Header.Get("Content-Type")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "Target received POST")
+	}))
+	defer targetServer.Close()
 
-    keys := []string{"geminikey"}
-    km, _ := newKeyManager(keys, 1*time.Minute)
-    proxy := newTestProxy(targetServer, km)
-    // Enable google search addition
-    mainHandler := createMainHandler(proxy, true, "") // addGoogleSearch=true
+	keys := []string{"geminikey"}
+	km, _ := newKeyManager(keys, 1*time.Minute)
+	proxy := newTestProxy(targetServer, km)
+	// Enable google search addition
+	mainHandler := createMainHandler(proxy, true, "") // addGoogleSearch=true
 
-    // Test case 1: Simple JSON body, should have tools added
-    postBody1 := `{"contents": [{"parts":[{"text":"hello"}]}]}`
-    expectedBody1 := `{"contents":[{"parts":[{"text":"hello"}]}],"tools":[{"google_search":{}}]}`
-    req1 := httptest.NewRequest("POST", "http://localhost:8080/v1beta/models/gemini-pro:generateContent", strings.NewReader(postBody1))
-    req1.Header.Set("Content-Type", "application/json")
-    rr1 := httptest.NewRecorder()
-    mainHandler(rr1, req1)
+	// Test case 1: Simple JSON body, should have tools added
+	postBody1 := `{"contents": [{"parts":[{"text":"hello"}]}]}`
+	expectedBody1 := `{"contents":[{"parts":[{"text":"hello"}]}],"tools":[{"google_search":{}}]}`
+	req1 := httptest.NewRequest("POST", "http://localhost:8080/v1beta/models/gemini-pro:generateContent", strings.NewReader(postBody1))
+	req1.Header.Set("Content-Type", "application/json")
+	rr1 := httptest.NewRecorder()
+	mainHandler(rr1, req1)
 
-    resp1 := rr1.Result()
-    assertInt(t, resp1.StatusCode, http.StatusOK)
-    assertString(t, receivedBody, expectedBody1)
-    assertString(t, receivedApiKey, "geminikey")
-    assertString(t, receivedContentType, "application/json")
-    receivedBody = "" // Reset for next test
-    receivedApiKey = ""
-    receivedContentType = ""
+	resp1 := rr1.Result()
+	assertInt(t, resp1.StatusCode, http.StatusOK)
+	assertString(t, receivedBody, expectedBody1)
+	assertString(t, receivedApiKey, "geminikey")
+	assertString(t, receivedContentType, "application/json")
+	receivedBody = "" // Reset for next test
+	receivedApiKey = ""
+	receivedContentType = ""
 
+	// Test case 2: Body already contains tools array, trigger word found, should replace with google_search
+	postBody2 := `{"contents": [{"parts":[{"text":"search now"}]}], "tools": [{"some_other_tool":{}}]}`
+	expectedBody2 := `{"contents":[{"parts":[{"text":"search now"}]}],"tools":[{"google_search":{}}]}` // Replaced
+	req2 := httptest.NewRequest("POST", "http://localhost:8080/v1beta/models/gemini-1.5-flash:generateContent", strings.NewReader(postBody2))
+	req2.Header.Set("Content-Type", "application/json")
+	rr2 := httptest.NewRecorder()
+	searchHandler := createMainHandler(proxy, true, "search") // Add trigger word
+	searchHandler(rr2, req2)
 
-    // Test case 2: Body already contains tools array, trigger word found, should replace with google_search
-    postBody2 := `{"contents": [{"parts":[{"text":"search now"}]}], "tools": [{"some_other_tool":{}}]}`
-    expectedBody2 := `{"contents":[{"parts":[{"text":"search now"}]}],"tools":[{"google_search":{}}]}` // Replaced
-    req2 := httptest.NewRequest("POST", "http://localhost:8080/v1beta/models/gemini-1.5-flash:generateContent", strings.NewReader(postBody2))
-    req2.Header.Set("Content-Type", "application/json")
-    rr2 := httptest.NewRecorder()
-		searchHandler := createMainHandler(proxy, true, "search") // Add trigger word
-    searchHandler(rr2, req2)
+	resp2 := rr2.Result()
+	assertInt(t, resp2.StatusCode, http.StatusOK)
+	assertString(t, receivedBody, expectedBody2)
+	assertString(t, receivedApiKey, "geminikey")
+	assertString(t, receivedContentType, "application/json")
+	receivedBody = "" // Reset
+	receivedApiKey = ""
+	receivedContentType = ""
 
-    resp2 := rr2.Result()
-    assertInt(t, resp2.StatusCode, http.StatusOK)
-    assertString(t, receivedBody, expectedBody2)
-    assertString(t, receivedApiKey, "geminikey")
-    assertString(t, receivedContentType, "application/json")
-    receivedBody = "" // Reset
-    receivedApiKey = ""
-    receivedContentType = ""
+	// Test case 3: Non-Gemini path, should NOT be modified
+	mainHandlerNoModify := createMainHandler(proxy, true, "") // Still true, but path won't match
+	postBody3 := `{"data": "value"}`
+	req3 := httptest.NewRequest("POST", "http://localhost:8080/other/api/v1/generate", strings.NewReader(postBody3))
+	req3.Header.Set("Content-Type", "application/json")
+	rr3 := httptest.NewRecorder()
+	mainHandlerNoModify(rr3, req3)
 
-
-    // Test case 3: Non-Gemini path, should NOT be modified
-		mainHandlerNoModify := createMainHandler(proxy, true, "") // Still true, but path won't match
-    postBody3 := `{"data": "value"}`
-    req3 := httptest.NewRequest("POST", "http://localhost:8080/other/api/v1/generate", strings.NewReader(postBody3))
-    req3.Header.Set("Content-Type", "application/json")
-    rr3 := httptest.NewRecorder()
-    mainHandlerNoModify(rr3, req3)
-
-    resp3 := rr3.Result()
-    assertInt(t, resp3.StatusCode, http.StatusOK)
-    assertString(t, receivedBody, postBody3)
-    assertString(t, receivedApiKey, "geminikey")
-    assertString(t, receivedContentType, "application/json")
+	resp3 := rr3.Result()
+	assertInt(t, resp3.StatusCode, http.StatusOK)
+	assertString(t, receivedBody, postBody3)
+	assertString(t, receivedApiKey, "geminikey")
+	assertString(t, receivedContentType, "application/json")
 }
 
-
 func TestCreateMainHandler_AddGoogleSearchFalse(t *testing.T) {
-    // Verify body is NOT modified when addGoogleSearch is false, even for Gemini paths
-    var receivedBody string
-    targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        bodyBytes, _ := io.ReadAll(r.Body)
-        receivedBody = string(bodyBytes)
-        w.WriteHeader(http.StatusOK)
-    }))
-    defer targetServer.Close()
+	// Verify body is NOT modified when addGoogleSearch is false, even for Gemini paths
+	var receivedBody string
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		receivedBody = string(bodyBytes)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer targetServer.Close()
 
-    keys := []string{"nokey"}
-    km, _ := newKeyManager(keys, 1*time.Minute)
-    proxy := newTestProxy(targetServer, km)
-    mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
+	keys := []string{"nokey"}
+	km, _ := newKeyManager(keys, 1*time.Minute)
+	proxy := newTestProxy(targetServer, km)
+	mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
 
-    postBody := `{"contents": [{"parts":[{"text":"hello"}]}]}`
-    req := httptest.NewRequest("POST", "http://localhost:8080/v1beta/models/gemini-pro:generateContent", strings.NewReader(postBody))
-    req.Header.Set("Content-Type", "application/json")
-    rr := httptest.NewRecorder()
-    mainHandler(rr, req)
+	postBody := `{"contents": [{"parts":[{"text":"hello"}]}]}`
+	req := httptest.NewRequest("POST", "http://localhost:8080/v1beta/models/gemini-pro:generateContent", strings.NewReader(postBody))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mainHandler(rr, req)
 
-    resp := rr.Result()
-    assertInt(t, resp.StatusCode, http.StatusOK)
-    assertString(t, receivedBody, postBody)
+	resp := rr.Result()
+	assertInt(t, resp.StatusCode, http.StatusOK)
+	assertString(t, receivedBody, postBody)
 }
