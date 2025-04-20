@@ -44,7 +44,9 @@ func TestCreateProxyDirector_AddsKeyToQueryAndRotates(t *testing.T) {
 		req.URL.Host = targetURL.Host
 		// Path changes per request in loop
 	}
-	director := createProxyDirector(km, targetURL, keyParam, originalDirector)
+	// Test with paths that should use query params (not matching header paths)
+	headerPaths := []string{"/openai/", "/v1/special"}
+	director := createProxyDirector(km, targetURL, keyParam, headerPaths, originalDirector)
 
 	usedIndices := make(map[int]bool)
 	numRequests := len(keys) * 3 // Make enough requests to likely see rotation
@@ -58,8 +60,9 @@ func TestCreateProxyDirector_AddsKeyToQueryAndRotates(t *testing.T) {
 
 		director(req)
 
-		// Check key is added
+		// Check key is added to query param
 		usedKey := req.URL.Query().Get(keyParam)
+		authHeader := req.Header.Get("Authorization")
 		keyIndexVal := req.Context().Value(keyIndexContextKey)
 		assertNotNil(t, keyIndexVal, "key index should be in context for request %d", i)
 		keyIndex := keyIndexVal.(int)
@@ -69,6 +72,9 @@ func TestCreateProxyDirector_AddsKeyToQueryAndRotates(t *testing.T) {
 		}
 		if usedKey != keys[keyIndex] {
 			t.Errorf("Request %d: Expected key %q in query param %q, got %q for index %d", i, keys[keyIndex], keyParam, usedKey, keyIndex)
+		}
+		if authHeader != "" {
+			t.Errorf("Request %d: Expected Authorization header to be empty, got %q", i, authHeader)
 		}
 		assertString(t, req.URL.Scheme, "http")
 		assertString(t, req.URL.Host, "example.com")
@@ -94,9 +100,11 @@ func TestCreateProxyDirector_UsesAuthorizationHeader(t *testing.T) {
 		req.URL.Host = targetURL.Host
 		req.URL.Path = testPath // Set the correct path
 	}
-	director := createProxyDirector(km, targetURL, keyParam, originalDirector)
+	// Ensure the test path matches one of the configured header paths
+	headerPaths := []string{"/openai/", "/v1/special"}
+	director := createProxyDirector(km, targetURL, keyParam, headerPaths, originalDirector)
 
-	req := httptest.NewRequest("GET", testPath, nil) // Use the correct path
+	req := httptest.NewRequest("GET", testPath, nil) // Use the correct path (/openai/v1/chat/completions)
 	req.Header.Set("Authorization", "Bearer old_token") // Set an existing header
 	director(req)
 
@@ -126,9 +134,10 @@ func TestCreateProxyDirector_NoKeysAvailable(t *testing.T) {
 	targetURL, _ := url.Parse("http://example.com")
 	keyParam := "api_key"
 	originalDirector := func(req *http.Request) {} // Simple original director
-	director := createProxyDirector(km, targetURL, keyParam, originalDirector)
+	headerPaths := []string{"/openai/"} // Doesn't matter for this test
+	director := createProxyDirector(km, targetURL, keyParam, headerPaths, originalDirector)
 
-	req := httptest.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest("GET", "/test", nil) // Path doesn't matter here
 	director(req)
 
 	// Check if error is added to context
@@ -405,10 +414,13 @@ func TestCreateProxyErrorHandler_HandlesGenericError(t *testing.T) {
 // --- Test createMainHandler (Basic Tests) ---
 
 // Helper to create a minimal proxy for handler tests
-func newTestProxy(targetServer *httptest.Server, keyMan *keyManager) *httputil.ReverseProxy {
+// Helper to create a minimal proxy for handler tests
+// Allows specifying header paths for director configuration
+func newTestProxy(targetServer *httptest.Server, keyMan *keyManager, headerAuthPaths []string) *httputil.ReverseProxy {
 	targetURL, _ := url.Parse(targetServer.URL)
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Director = createProxyDirector(keyMan, targetURL, "key", proxy.Director) // Use default director flow
+	originalDirector := proxy.Director
+	proxy.Director = createProxyDirector(keyMan, targetURL, "key", headerAuthPaths, originalDirector)
 	proxy.ModifyResponse = createProxyModifyResponse(keyMan)
 	proxy.ErrorHandler = createProxyErrorHandler()
 	return proxy
@@ -423,10 +435,11 @@ func TestCreateMainHandler_CorsHeaders(t *testing.T) {
 
 	keys := []string{"testkey"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
-	proxy := newTestProxy(targetServer, km)
+	headerPaths := []string{"/openai/"} // Example header paths
+	proxy := newTestProxy(targetServer, km, headerPaths)
 	mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
 
-	// Test GET request
+	// Test GET request (should use query param)
 	reqGet := httptest.NewRequest("GET", "http://localhost:8080/some/path", nil)
 	rrGet := httptest.NewRecorder()
 	mainHandler(rrGet, reqGet)
@@ -468,10 +481,12 @@ func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 
 	keys := []string{"postkey1"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
-	proxy := newTestProxy(targetServer, km)
+	headerPaths := []string{"/openai/"} // Example header paths
+	proxy := newTestProxy(targetServer, km, headerPaths)
 	mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
 
 	postBody := `{"data": "value"}`
+	// Use a path that should use query param
 	req := httptest.NewRequest("POST", "http://localhost:8080/non-gemini/path", strings.NewReader(postBody))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
@@ -504,7 +519,8 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 
 	keys := []string{"geminikey"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
-	proxy := newTestProxy(targetServer, km)
+	headerPaths := []string{"/openai/"} // Example header paths
+	proxy := newTestProxy(targetServer, km, headerPaths)
 	// Enable google search addition
 	mainHandler := createMainHandler(proxy, true, "") // addGoogleSearch=true
 
@@ -570,10 +586,12 @@ func TestCreateMainHandler_AddGoogleSearchFalse(t *testing.T) {
 
 	keys := []string{"nokey"}
 	km, _ := newKeyManager(keys, 1*time.Minute)
-	proxy := newTestProxy(targetServer, km)
+	headerPaths := []string{"/openai/"} // Example header paths
+	proxy := newTestProxy(targetServer, km, headerPaths)
 	mainHandler := createMainHandler(proxy, false, "") // addGoogleSearch=false
 
 	postBody := `{"contents": [{"parts":[{"text":"hello"}]}]}`
+	// Path matches Gemini pattern but not header path, should use query param
 	req := httptest.NewRequest("POST", "http://localhost:8080/v1beta/models/gemini-pro:generateContent", strings.NewReader(postBody))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()

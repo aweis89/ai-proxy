@@ -18,6 +18,7 @@ func main() {
 	keysRaw := flag.String("keys", os.Getenv("GEMINI_API_KEYS"), "Comma-separated list of API keys (required)")
 	removalDuration := flag.Duration("removal-duration", 1*time.Hour, "Duration to remove a failing key from rotation")
 	overrideKeyParam := flag.String("key-param", "key", "The name of the query parameter containing the API key to override")
+	headerAuthPathsRaw := flag.String("header-auth-paths", "/openai", "Comma-separated list of path prefixes that should use Authorization header instead of query param")
 	addGoogleSearch := flag.Bool("add-google-search", true, "Automatically add google_search tool based on conditions")
 	searchTrigger := flag.String("search-trigger", "search", "Word in user message that forces google_search and removes functionDeclarations")
 
@@ -39,6 +40,18 @@ func main() {
 		log.Fatal("Error: No non-empty API keys provided in the -keys flag.")
 	}
 
+	// Process header auth paths
+	headerAuthPaths := []string{}
+	if *headerAuthPathsRaw != "" {
+		for _, p := range strings.Split(*headerAuthPathsRaw, ",") {
+			trimmedPath := strings.TrimSpace(p)
+			if trimmedPath != "" {
+				headerAuthPaths = append(headerAuthPaths, trimmedPath)
+			}
+		}
+	}
+
+
 	targetURL, err := url.Parse(*targetHost)
 	if err != nil {
 		log.Fatalf("Error parsing target host URL: %v", err)
@@ -58,14 +71,17 @@ func main() {
 
 	// --- Customize Proxy ---
 	originalDirector := proxy.Director // Save original director
-	proxy.Director = createProxyDirector(keyMan, targetURL, *overrideKeyParam, originalDirector)
+	proxy.Director = createProxyDirector(keyMan, targetURL, *overrideKeyParam, headerAuthPaths, originalDirector)
 	proxy.ModifyResponse = createProxyModifyResponse(keyMan)
 	proxy.ErrorHandler = createProxyErrorHandler()
 
 	// --- Start HTTP Server ---
 	log.Printf("Starting proxy server on %s", *listenAddr)
 	log.Printf("Forwarding requests to %s", targetURL.String())
-	log.Printf("Overriding query parameter '%s'", *overrideKeyParam)
+	log.Printf("Using query parameter '%s' for API key (default)", *overrideKeyParam)
+	if len(headerAuthPaths) > 0 {
+		log.Printf("Using Authorization header for paths starting with: %v", headerAuthPaths)
+	}
 	log.Printf("Key removal duration on failure: %s", *removalDuration)
 	log.Printf("Add google_search tool conditionally: %t", *addGoogleSearch)
 	if *addGoogleSearch {

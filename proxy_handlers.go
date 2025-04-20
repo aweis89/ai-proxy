@@ -15,8 +15,8 @@ import (
 )
 
 // createProxyDirector returns a function that modifies the request before forwarding.
-// It selects an API key, sets it in the query parameters, and handles key retrieval errors.
-func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyParam string, originalDirector func(*http.Request)) func(*http.Request) {
+// It selects an API key, sets it based on path configuration (header or query param), and handles key retrieval errors.
+func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyParam string, headerAuthPaths []string, originalDirector func(*http.Request)) func(*http.Request) {
 	return func(req *http.Request) {
 		originalDirector(req) // Run the default director first
 
@@ -32,16 +32,27 @@ func createProxyDirector(keyMan *keyManager, targetURL *url.URL, overrideKeyPara
 		*req = *req.WithContext(context.WithValue(req.Context(), keyIndexContextKey, keyIndex))
 
 		existingHeader := req.Header.Get("Authorization")
-		fmt.Printf("Existing Authorization header: %s\n", existingHeader)
-		fmt.Printf("Existing URL: %s\n", req.URL.String())
+		fmt.Printf("Existing Authorization header: %s\n", existingHeader) // Keep for debugging if needed
+		fmt.Printf("Existing URL: %s\n", req.URL.String()) // Keep for debugging if needed
 
-		useHeader := "/openai"
+		useHeaderAuth := false
+		for _, prefix := range headerAuthPaths {
+			if strings.HasPrefix(req.URL.Path, prefix) {
+				useHeaderAuth = true
+				break
+			}
+		}
 
-		if strings.Contains(req.URL.Path, useHeader) {
+		if useHeaderAuth {
+			log.Printf("Using Authorization header for path: %s", req.URL.Path)
 			req.Header.Set("Authorization", "Bearer "+apiKey)
-			fmt.Printf("Authorization header set to: %s\n", req.Header.Get("Authorization"))
+			// Remove the query param if it exists from original request (optional, but cleaner)
+			query := req.URL.Query()
+			query.Del(overrideKeyParam)
+			req.URL.RawQuery = query.Encode()
 		} else {
-			req.Header.Del("Authorization")
+			log.Printf("Using query parameter '%s' for path: %s", overrideKeyParam, req.URL.Path)
+			req.Header.Del("Authorization") // Ensure Authorization header is removed
 			query := req.URL.Query()
 			query.Set(overrideKeyParam, apiKey)
 			req.URL.RawQuery = query.Encode()
