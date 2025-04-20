@@ -48,24 +48,30 @@ func createProxyModifyResponse(keyMan *keyManager) func(*http.Response) error {
 			log.Println("Warning: No key index found in request context for ModifyResponse.")
 			// Log non-2xx status even if key index is missing
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				log.Printf("Received non-2xx status: %d (Key Index Unknown)", resp.StatusCode)
+				log.Printf("Received non-2xx status: %d (Key Index Unknown, Scope Unknown)", resp.StatusCode)
 				// Log body without key context
 				logResponseBody(resp)
 			}
 			return nil // Return early as there's no key index to process further
 		}
 
-		// Log response body for non-2xx status codes, now with key index context
+		// Build scope key from the original request URL in the response context
+		// Note: Use resp.Request.URL, not the original request's URL, as the host/path might have been modified.
+		// However, the director we use doesn't modify the path, and retryTransport uses the *original* req for scope.
+		// For consistency, let's build the scope the same way retryTransport does.
+		scope := buildScopeKey(resp.Request.URL.Host, resp.Request.URL.Path)
+
+		// Log response body for non-2xx status codes, now with key index and scope context
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Printf("Request using key index %d (last attempt) received non-2xx status: %d", keyIndex, resp.StatusCode)
+			log.Printf("Scope '%s': Request using key index %d (last attempt) received non-2xx status: %d", scope, keyIndex, resp.StatusCode)
 			logResponseBody(resp) // Use helper to read/restore body
 
 			// Mark key as failed for non-retryable client errors (4xx) that weren't handled by transport.
 			// Transport handles 429. This handles things like 400, 401, 403 etc.
 			// Avoid marking for 5xx here, as transport might retry those, and they aren't key-specific.
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
-				log.Printf("Marking key index %d as failing due to non-retryable client error status %d.", keyIndex, resp.StatusCode)
-				keyMan.markKeyFailed(keyIndex)
+				log.Printf("Scope '%s': Marking key index %d as failing due to non-retryable client error status %d.", scope, keyIndex, resp.StatusCode)
+				keyMan.markKeyFailed(scope, keyIndex) // Use scope here
 			}
 		}
 
@@ -104,27 +110,28 @@ func createProxyErrorHandler() func(http.ResponseWriter, *http.Request, error) {
 	return func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("Proxy ErrorHandler triggered after transport/retries: %v", err)
 
-		// Log key index if available
+		// Log key index and scope if available
+		scope := buildScopeKey(req.URL.Host, req.URL.Path)
 		keyIndexVal := req.Context().Value(keyIndexContextKey)
 		if keyIndex, ok := keyIndexVal.(int); ok {
-			log.Printf("-> Last attempt used key index %d", keyIndex)
+			log.Printf("-> Scope '%s': Last attempt used key index %d", scope, keyIndex)
 		} else {
-			log.Printf("-> Key index for last attempt not found in context.")
+			log.Printf("-> Scope '%s': Key index for last attempt not found in context.", scope)
 		}
 
 		// Check for specific error types to determine the response status code.
 		var proxyErrWithStatus *proxyErrorWithStatus
 		if errors.As(err, &proxyErrWithStatus) {
 			// Use the status code from the error returned by the transport
-			log.Printf("--> Responding to client with upstream status: %d", proxyErrWithStatus.StatusCode)
+			log.Printf("--> Scope '%s': Responding to client with upstream status: %d", scope, proxyErrWithStatus.StatusCode)
 			http.Error(rw, err.Error(), proxyErrWithStatus.StatusCode)
 		} else if errors.Is(err, context.Canceled) {
 			// Client closed the connection
-			log.Printf("--> Responding to client with status: %d (Context Canceled)", http.StatusRequestTimeout)
+			log.Printf("--> Scope '%s': Responding to client with status: %d (Context Canceled)", scope, http.StatusRequestTimeout)
 			http.Error(rw, "Client connection closed", http.StatusRequestTimeout) // 499 Client Closed Request is common
 		} else {
 			// Generic transport error (connection refused, DNS error, etc.)
-			log.Printf("--> Responding to client with status: %d (Bad Gateway)", http.StatusBadGateway)
+			log.Printf("--> Scope '%s': Responding to client with status: %d (Bad Gateway)", scope, http.StatusBadGateway)
 			// Use the message expected by the test for generic upstream failures
 			http.Error(rw, "Proxy Error: Upstream server failed after retries", http.StatusBadGateway) // 502
 		}

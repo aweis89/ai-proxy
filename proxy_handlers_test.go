@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"reflect" // Ensure reflect is imported for helpers
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ import (
 // TODO: Move common assert helpers to a shared file.
 func assertNotNil(t *testing.T, val interface{}, msgAndArgs ...interface{}) {
 	t.Helper()
-	if val == nil {
+	if val == nil || (reflect.ValueOf(val).Kind() == reflect.Ptr && reflect.ValueOf(val).IsNil()) {
 		message := "got nil, want non-nil value"
 		if len(msgAndArgs) > 0 {
 			baseMsg := msgAndArgs[0].(string)
@@ -34,16 +35,25 @@ func assertNotNil(t *testing.T, val interface{}, msgAndArgs ...interface{}) {
 
 // --- Test createProxyModifyResponse ---
 
-// Test that ModifyResponse marks keys as failed for non-retryable 4xx errors.
-// Note: 429 is handled by the retryTransport, so we test other 4xx codes here.
+// Test that ModifyResponse marks keys as failed for non-retryable 4xx errors within the correct scope.
 func TestCreateProxyModifyResponse_MarksKeyFailedOnNonRetryable4xx(t *testing.T) {
 	keys := []string{"key1", "key2"}
 	km, _ := newKeyManager(keys, 5*time.Minute)
 	modifier := createProxyModifyResponse(km)
 
+	scope := "test.com|/v1/fail" // Example scope
+	baseURL := "http://test.com/v1/fail"
+
 	// Simulate key 0 was used for a 400 Bad Request
 	ctx0 := context.WithValue(context.Background(), keyIndexContextKey, 0)
-	req0 := httptest.NewRequest("POST", "/", nil).WithContext(ctx0)
+	req0 := httptest.NewRequest("POST", baseURL, nil).WithContext(ctx0)
+	// Ensure the request URL host and path match the scope for accurate testing
+	parsedURL0, _ := url.Parse(baseURL)
+	// The context should hold the original host/path used for getNextKey/markKeyFailed
+	// In a real scenario, resp.Request.URL might differ if the proxy modified it,
+	// but ModifyResponse should build the scope based on the URL in resp.Request.
+	// For this test, we ensure resp.Request.URL matches our intended scope.
+	req0.URL = parsedURL0 // Set URL on the request that goes into the Response
 	resp0 := &http.Response{
 		StatusCode: http.StatusBadRequest, // 400
 		Request:    req0,
@@ -52,21 +62,25 @@ func TestCreateProxyModifyResponse_MarksKeyFailedOnNonRetryable4xx(t *testing.T)
 	err := modifier(resp0)
 	assertNoError(t, err)
 
+	// Check state for key 0 in the specific scope
 	km.mu.Lock()
-	_, isAvailable0 := km.availableKeys[0]
-	_, isFailing0 := km.failingKeys[0]
+	state0 := getScopeState(t, km, scope) // Use helper to get state
+	_, isAvailable0 := state0.availableKeys[0]
+	_, isFailing0 := state0.failingKeys[0]
 	km.mu.Unlock()
 
 	if isAvailable0 {
-		t.Error("Expected key 0 to be removed from available keys for 400")
+		t.Errorf("Scope '%s': Expected key 0 to be removed from available keys for 400", scope)
 	}
 	if !isFailing0 {
-		t.Error("Expected key 0 to be added to failing keys for 400")
+		t.Errorf("Scope '%s': Expected key 0 to be added to failing keys for 400", scope)
 	}
 
-	// Simulate key 1 was used for a 403 Forbidden
+	// Simulate key 1 was used for a 403 Forbidden in the SAME scope
 	ctx1 := context.WithValue(context.Background(), keyIndexContextKey, 1)
-	req1 := httptest.NewRequest("GET", "/forbidden", nil).WithContext(ctx1)
+	req1 := httptest.NewRequest("GET", baseURL, nil).WithContext(ctx1)
+	parsedURL1, _ := url.Parse(baseURL)
+	req1.URL = parsedURL1
 	resp1 := &http.Response{
 		StatusCode: http.StatusForbidden, // 403
 		Request:    req1,
@@ -75,22 +89,35 @@ func TestCreateProxyModifyResponse_MarksKeyFailedOnNonRetryable4xx(t *testing.T)
 	err = modifier(resp1)
 	assertNoError(t, err)
 
+	// Check state for key 1 in the specific scope
 	km.mu.Lock()
-	_, isAvailable1 := km.availableKeys[1]
-	_, isFailing1 := km.failingKeys[1]
+	state1 := getScopeState(t, km, scope) // Get state again
+	_, isAvailable1 := state1.availableKeys[1]
+	_, isFailing1 := state1.failingKeys[1]
 	km.mu.Unlock()
 
 	if isAvailable1 {
-		t.Error("Expected key 1 to be removed from available keys for 403")
+		t.Errorf("Scope '%s': Expected key 1 to be removed from available keys for 403", scope)
 	}
 	if !isFailing1 {
-		t.Error("Expected key 1 to be added to failing keys for 403")
+		t.Errorf("Scope '%s': Expected key 1 to be added to failing keys for 403", scope)
 	}
 
-	// Check that both keys are now failing
+	// Check that both keys are now failing IN THIS SCOPE
 	km.mu.Lock()
-	assertInt(t, len(km.availableKeys), 0)
-	assertInt(t, len(km.failingKeys), 2)
+	finalState := getScopeState(t, km, scope)
+	assertInt(t, len(finalState.availableKeys), 0)
+	assertInt(t, len(finalState.failingKeys), 2)
+	km.mu.Unlock()
+
+	// Check another scope remains unaffected
+	otherScope := "unaffected.com|/v1/ok"
+	_, _, errOther := km.getNextKey(otherScope) // Access to create/check
+	assertNoError(t, errOther)
+	km.mu.Lock()
+	otherState := getScopeState(t, km, otherScope)
+	assertInt(t, len(otherState.availableKeys), 2) // Both keys should be available
+	assertInt(t, len(otherState.failingKeys), 0)
 	km.mu.Unlock()
 
 	// Ensure response bodies are still readable after being logged
@@ -103,16 +130,20 @@ func TestCreateProxyModifyResponse_MarksKeyFailedOnNonRetryable4xx(t *testing.T)
 	assertString(t, string(bodyBytes1), "Access denied")
 }
 
-// Test that ModifyResponse does NOT mark keys as failed for 2xx or 5xx status codes.
-// 5xx might be retried by the transport, and 2xx are successes.
-// 429 is also handled by transport, so it shouldn't be marked here either.
+// Test that ModifyResponse does NOT mark keys as failed for 2xx, 5xx, or 429 status codes.
 func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOnSuccessOrRetryable(t *testing.T) {
 	keys := []string{"key1"}
 	km, _ := newKeyManager(keys, 5*time.Minute)
 	modifier := createProxyModifyResponse(km)
+	scope := "test.com|/v1/ok" // Example scope
+	baseURL := "http://test.com/v1/ok"
 
+	// Test 200 OK
 	ctx := context.WithValue(context.Background(), keyIndexContextKey, 0)
-	req := httptest.NewRequest("GET", "/", nil).WithContext(ctx)
+	req := httptest.NewRequest("GET", baseURL, nil).WithContext(ctx)
+	parsedURL, _ := url.Parse(baseURL)
+	// Set the URL on the request that will be embedded in the Response object
+	req.URL = parsedURL
 	resp := &http.Response{
 		StatusCode: http.StatusOK, // 200
 		Request:    req,
@@ -122,27 +153,45 @@ func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOnSuccessOrRetryable(t *t
 	err := modifier(resp)
 	assertNoError(t, err)
 
-	// Check key 0 is still available
+	// Check key 0 is still available (need to check scope state)
+	// Get the scope state to check.
+	// Note: Calling modifier doesn't create the scope if it doesn't exist,
+	// because getNextKey is called elsewhere (in transport).
+	// In this test, the scope *shouldn't* exist yet as we haven't called getNextKey
+	// for this specific scope before calling modifier(resp) for the 200 OK.
 	km.mu.Lock()
-	_, isAvailable := km.availableKeys[0]
-	_, isFailing := km.failingKeys[0]
+	state, scopeExists := km.scopes[scope]
 	km.mu.Unlock()
 
-	if !isAvailable {
-		t.Error("Expected key 0 to still be available")
-	}
-	if isFailing {
-		t.Error("Expected key 0 not to be failing")
-	}
+	if scopeExists && state != nil {
+		km.mu.Lock() // Lock again to access state fields safely
+		_, isAvailable := state.availableKeys[0]
+		_, isFailing := state.failingKeys[0]
+		km.mu.Unlock()
+		// If the scope somehow exists (it shouldn't at this point), the key should still be available and not failing
+		if !isAvailable {
+			t.Errorf("Scope '%s': Expected key 0 to still be available after 200", scope)
+		}
+		if isFailing {
+			t.Errorf("Scope '%s': Expected key 0 not to be failing after 200", scope)
+		}
+	} // If scope doesn't exist, that's the expected state, as modifier doesn't create scopes.
 
 	// Ensure response body is still readable
 	bodyBytes, readErr := io.ReadAll(resp.Body)
 	assertNoError(t, readErr)
 	assertString(t, string(bodyBytes), "Success")
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes)) // Restore body for subsequent reads
 
-	// Test 500 Internal Server Error
+	// --- Test 500 Internal Server Error ---
+	// Need to ensure the scope exists before checking its state after the 500 response
+	// because the checks below assume the scope state exists.
+	_, _, err = km.getNextKey(scope) // This call creates the scope state if it doesn't exist
+	assertNoError(t, err)
+
 	ctx500 := context.WithValue(context.Background(), keyIndexContextKey, 0)
-	req500 := httptest.NewRequest("GET", "/", nil).WithContext(ctx500)
+	req500 := httptest.NewRequest("GET", baseURL, nil).WithContext(ctx500) // Use baseURL here
+	req500.URL = parsedURL
 	resp500 := &http.Response{
 		StatusCode: http.StatusInternalServerError, // 500
 		Request:    req500,
@@ -151,19 +200,25 @@ func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOnSuccessOrRetryable(t *t
 	err = modifier(resp500)
 	assertNoError(t, err)
 	km.mu.Lock()
-	_, isAvailable500 := km.availableKeys[0]
-	_, isFailing500 := km.failingKeys[0]
+	state500 := getScopeState(t, km, scope) // Now we can safely get the state
+	_, isAvailable500 := state500.availableKeys[0]
+	_, isFailing500 := state500.failingKeys[0]
 	km.mu.Unlock()
 	if !isAvailable500 {
-		t.Error("Expected key 0 to still be available after 500")
+		t.Errorf("Scope '%s': Expected key 0 to still be available after 500", scope)
 	}
 	if isFailing500 {
-		t.Error("Expected key 0 not to be failing after 500")
+		t.Errorf("Scope '%s': Expected key 0 not to be failing after 500", scope)
 	}
+	bodyBytes500, readErr500 := io.ReadAll(resp500.Body) // Read body after checks
+	assertNoError(t, readErr500)
+	assertString(t, string(bodyBytes500), "Server Error")
+	resp500.Body = io.NopCloser(bytes.NewReader(bodyBytes500)) // Restore body
 
-	// Test 429 Too Many Requests (should be handled by transport, not marked here)
+	// --- Test 429 Too Many Requests ---
 	ctx429 := context.WithValue(context.Background(), keyIndexContextKey, 0)
-	req429 := httptest.NewRequest("GET", "/", nil).WithContext(ctx429)
+	req429 := httptest.NewRequest("GET", baseURL, nil).WithContext(ctx429) // Use baseURL here
+	req429.URL = parsedURL
 	resp429 := &http.Response{
 		StatusCode: http.StatusTooManyRequests, // 429
 		Request:    req429,
@@ -172,27 +227,36 @@ func TestCreateProxyModifyResponse_DoesNotMarkKeyFailedOnSuccessOrRetryable(t *t
 	err = modifier(resp429)
 	assertNoError(t, err)
 	km.mu.Lock()
-	_, isAvailable429 := km.availableKeys[0]
-	_, isFailing429 := km.failingKeys[0]
+	state429 := getScopeState(t, km, scope) // Scope should exist from 500 test setup
+	_, isAvailable429 := state429.availableKeys[0]
+	_, isFailing429 := state429.failingKeys[0]
 	km.mu.Unlock()
 	if !isAvailable429 {
-		t.Error("Expected key 0 to still be available after 429 (handled by transport)")
+		t.Errorf("Scope '%s': Expected key 0 to still be available after 429 (handled by transport)", scope)
 	}
 	if isFailing429 {
-		t.Error("Expected key 0 not to be failing after 429 (handled by transport)")
+		t.Errorf("Scope '%s': Expected key 0 not to be failing after 429 (handled by transport)", scope)
 	}
+	bodyBytes429, readErr429 := io.ReadAll(resp429.Body) // Read body after checks
+	assertNoError(t, readErr429)
+	assertString(t, string(bodyBytes429), "Rate Limited")
+	// No need to restore body for the last check in the test
 }
 
-// Test resilience when key index is missing from context (shouldn't happen normally with transport)
+// Test resilience when key index is missing from context
 func TestCreateProxyModifyResponse_HandlesMissingKeyIndex(t *testing.T) {
-	// This shouldn't happen in normal operation if director ran, but test resilience
 	keys := []string{"key1"}
 	km, _ := newKeyManager(keys, 5*time.Minute)
 	modifier := createProxyModifyResponse(km)
+	scope := "test.com|/v1/mising" // Example scope
+	baseURL := "http://test.com/v1/mising"
 
-	req := httptest.NewRequest("GET", "/", nil) // No key index in context
+	req := httptest.NewRequest("GET", baseURL, nil) // No key index in context
+	parsedURL, _ := url.Parse(baseURL)
+	// Set URL on the request that goes into the Response
+	req.URL = parsedURL
 	resp := &http.Response{
-		StatusCode: http.StatusTooManyRequests, // 429
+		StatusCode: http.StatusNotFound, // 404 (use a code that *would* trigger marking)
 		Request:    req,
 		Body:       io.NopCloser(strings.NewReader("Error")),
 	}
@@ -205,33 +269,42 @@ func TestCreateProxyModifyResponse_HandlesMissingKeyIndex(t *testing.T) {
 	err := modifier(resp)
 	assertNoError(t, err) // Should not return an error itself
 
-	// Check key 0 was NOT marked as failed
+	// Check key 0 was NOT marked as failed (scope state shouldn't even exist unless created elsewhere)
 	km.mu.Lock()
-	_, isAvailable := km.availableKeys[0]
-	_, isFailing := km.failingKeys[0]
+	_, scopeExists := km.scopes[scope]
 	km.mu.Unlock()
-
-	if !isAvailable {
-		t.Error("Expected key 0 to still be available when index missing")
-	}
-	if isFailing {
-		t.Error("Expected key 0 not to be failing when index missing")
-	}
+	if scopeExists {
+		// If the scope exists, check the key wasn't marked failed
+		km.mu.Lock()
+		state := getScopeState(t, km, scope)
+		_, isFailing := state.failingKeys[0]
+		km.mu.Unlock()
+		if isFailing {
+			t.Errorf("Scope '%s': Expected key 0 not to be failing when index missing from context", scope)
+		}
+	} // else: scope not existing is also correct
 
 	// Check log output for warning
 	logOutput := logBuf.String()
-	// The specific check for "proxy error" is removed as director no longer sets it.
 	if !strings.Contains(logOutput, "Warning: No key index found in request context") {
 		t.Errorf("Expected log warning about missing key index, got: %s", logOutput)
+	}
+	// Check that the non-2xx logging happened without key index info
+	if !strings.Contains(logOutput, "Received non-2xx status: 404 (Key Index Unknown, Scope Unknown)") {
+		t.Errorf("Expected log message about non-2xx status without key index, got: %s", logOutput)
 	}
 }
 
 // --- Test createProxyErrorHandler ---
 
-// Test the error handler when a generic error is passed (simulating transport failure after retries)
+// Test the error handler when a generic error is passed
 func TestCreateProxyErrorHandler_HandlesGenericError(t *testing.T) {
 	handler := createProxyErrorHandler()
-	req := httptest.NewRequest("GET", "/", nil) // No specific proxy error in context
+	scope := "testerror.com|/v1/err"
+	baseURL := "http://testerror.com/v1/err"
+	req := httptest.NewRequest("GET", baseURL, nil)
+	parsedURL, _ := url.Parse(baseURL)
+	req.URL = parsedURL
 	rr := httptest.NewRecorder()
 	genericErr := errors.New("connection refused")
 
@@ -249,29 +322,68 @@ func TestCreateProxyErrorHandler_HandlesGenericError(t *testing.T) {
 	resp := rr.Result()
 	body, _ := io.ReadAll(resp.Body)
 
-	assertInt(t, resp.StatusCode, http.StatusBadGateway) // Should return 502
-	assertString(t, strings.TrimSpace(string(body)), "Proxy Error: Upstream server failed after retries") // Check updated message
+	assertInt(t, resp.StatusCode, http.StatusBadGateway)
+	assertString(t, strings.TrimSpace(string(body)), "Proxy Error: Upstream server failed after retries")
 
-	// Check log output includes the generic error and key index
+	// Check log output includes the generic error, key index, and scope
 	logOutput := logBuf.String()
 	if !strings.Contains(logOutput, "Proxy ErrorHandler triggered after transport/retries: connection refused") {
 		t.Errorf("Expected log message indicating handler trigger and error, got: %s", logOutput)
 	}
-	if !strings.Contains(logOutput, "-> Last attempt used key index 5") {
-		t.Errorf("Expected log message indicating last key index used, got: %s", logOutput)
+	if !strings.Contains(logOutput, fmt.Sprintf("-> Scope '%s': Last attempt used key index 5", scope)) {
+		t.Errorf("Expected log message indicating scope and last key index used, got: %s", logOutput)
 	}
-	if !strings.Contains(logOutput, "--> Responding to client with status: 502") {
-		t.Errorf("Expected log message indicating response status 502, got: %s", logOutput)
+	if !strings.Contains(logOutput, fmt.Sprintf("--> Scope '%s': Responding to client with status: 502", scope)) {
+		t.Errorf("Expected log message indicating scope and response status 502, got: %s", logOutput)
+	}
+}
+
+// Test the error handler when the error includes status code (proxyErrorWithStatus)
+func TestCreateProxyErrorHandler_HandlesProxyErrorWithStatus(t *testing.T) {
+	handler := createProxyErrorHandler()
+	scope := "testerror.com|/v1/statuserr"
+	baseURL := "http://testerror.com/v1/statuserr"
+	req := httptest.NewRequest("GET", baseURL, nil)
+	parsedURL, _ := url.Parse(baseURL)
+	req.URL = parsedURL
+	rr := httptest.NewRecorder()
+	statusErr := &proxyErrorWithStatus{
+		error:      errors.New("upstream unavailable"),
+		StatusCode: http.StatusServiceUnavailable, // 503
+	}
+
+	// Capture log output
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	handler(rr, req, statusErr)
+
+	resp := rr.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	assertInt(t, resp.StatusCode, http.StatusServiceUnavailable) // Should use status from error
+	assertString(t, strings.TrimSpace(string(body)), "upstream unavailable")
+
+	// Check log output
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Proxy ErrorHandler triggered after transport/retries: upstream unavailable") {
+		t.Errorf("Expected log message indicating handler trigger and error, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, fmt.Sprintf("--> Scope '%s': Responding to client with upstream status: 503", scope)) {
+		t.Errorf("Expected log message indicating scope and response status 503, got: %s", logOutput)
 	}
 }
 
 // Test the error handler when the error is context.Canceled
 func TestCreateProxyErrorHandler_HandlesContextCanceled(t *testing.T) {
 	handler := createProxyErrorHandler()
-	req := httptest.NewRequest("GET", "/", nil)
+	scope := "testerror.com|/v1/cancel"
+	baseURL := "http://testerror.com/v1/cancel"
+	req := httptest.NewRequest("GET", baseURL, nil)
+	parsedURL, _ := url.Parse(baseURL)
+	req.URL = parsedURL
 	rr := httptest.NewRecorder()
-	// Use context.DeadlineExceeded for a clearer timeout scenario, though Canceled is also common
-	// Let's stick with Canceled as that's what the handler checks for explicitly.
 	cancelErr := context.Canceled
 
 	// Capture log output
@@ -284,7 +396,6 @@ func TestCreateProxyErrorHandler_HandlesContextCanceled(t *testing.T) {
 	resp := rr.Result()
 	body, _ := io.ReadAll(resp.Body)
 
-	// The handler uses http.StatusRequestTimeout (408) for context.Canceled.
 	assertInt(t, resp.StatusCode, http.StatusRequestTimeout) // 408
 	assertString(t, strings.TrimSpace(string(body)), "Client connection closed")
 
@@ -294,12 +405,11 @@ func TestCreateProxyErrorHandler_HandlesContextCanceled(t *testing.T) {
 	if !strings.Contains(logOutput, expectedTriggerMsg) {
 		t.Errorf("Expected log message indicating handler trigger and cancel error, got: %s", logOutput)
 	}
-	// Key index won't be present if context is canceled early
-	if !strings.Contains(logOutput, "-> Key index for last attempt not found in context.") {
-		t.Errorf("Expected log message about missing key index for canceled context, got: %s", logOutput)
+	if !strings.Contains(logOutput, fmt.Sprintf("-> Scope '%s': Key index for last attempt not found", scope)) {
+		t.Errorf("Expected log message about scope and missing key index for canceled context, got: %s", logOutput)
 	}
-	if !strings.Contains(logOutput, fmt.Sprintf("--> Responding to client with status: %d", http.StatusRequestTimeout)) {
-		t.Errorf("Expected log message indicating response status %d, got: %s", http.StatusRequestTimeout, logOutput)
+	if !strings.Contains(logOutput, fmt.Sprintf("--> Scope '%s': Responding to client with status: %d", scope, http.StatusRequestTimeout)) {
+		t.Errorf("Expected log message indicating scope and response status %d, got: %s", http.StatusRequestTimeout, logOutput)
 	}
 }
 
@@ -316,7 +426,7 @@ func newTestProxy(targetServer *httptest.Server, keyMan *keyManager, keyParam st
 
 	// Setup simplified director
 	originalDirector := proxy.Director
-	proxy.Director = createProxyDirector(targetURL, originalDirector) // Simplified call
+	proxy.Director = createProxyDirector(targetURL, originalDirector)
 
 	// Setup other handlers
 	proxy.ModifyResponse = createProxyModifyResponse(keyMan)
@@ -325,8 +435,13 @@ func newTestProxy(targetServer *httptest.Server, keyMan *keyManager, keyParam st
 }
 
 func TestCreateMainHandler_CorsHeaders(t *testing.T) {
-	// Setup a dummy target server
+	// Setup a dummy target server that checks the key
 	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") == "" && r.Header.Get("Authorization") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintln(w, "Missing key")
+			return
+		}
 		fmt.Fprintln(w, "Hello from target")
 	}))
 	defer targetServer.Close()
@@ -376,6 +491,11 @@ func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 		// Check how the key was received by the target (set by retryTransport)
 		receivedApiKey = r.URL.Query().Get("key")
 		receivedAuthHeader = r.Header.Get("Authorization")
+		if receivedApiKey == "" && receivedAuthHeader == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintln(w, "Missing key")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "Target received POST")
 	}))
@@ -399,8 +519,8 @@ func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 	resp1 := rr1.Result()
 	assertInt(t, resp1.StatusCode, http.StatusOK)
 	assertString(t, receivedBody, postBody)
-	assertString(t, receivedApiKey, "postkey1") // Key should be in query param
-	assertString(t, receivedAuthHeader, "")     // Auth header should be empty
+	assertString(t, receivedApiKey, "postkey1")                   // Key should be in query param
+	assertString(t, receivedAuthHeader, "")                       // Auth header should be empty
 	receivedBody, receivedApiKey, receivedAuthHeader = "", "", "" // Reset
 
 	// --- Test 2: Path matching headerAuthPaths (should use Authorization header) ---
@@ -412,7 +532,7 @@ func TestCreateMainHandler_PostRequestForwarding(t *testing.T) {
 	resp2 := rr2.Result()
 	assertInt(t, resp2.StatusCode, http.StatusOK)
 	assertString(t, receivedBody, postBody)
-	assertString(t, receivedApiKey, "") // Key should NOT be in query param
+	assertString(t, receivedApiKey, "")                    // Key should NOT be in query param
 	assertString(t, receivedAuthHeader, "Bearer postkey1") // Key should be in header
 }
 
@@ -429,6 +549,11 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 		receivedApiKey = r.URL.Query().Get("key") // Gemini paths use query param by default
 		receivedAuthHeader = r.Header.Get("Authorization")
 		receivedContentType = r.Header.Get("Content-Type")
+		if receivedApiKey == "" && receivedAuthHeader == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintln(w, "Missing key")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "Target received POST")
 	}))
@@ -454,7 +579,7 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 	assertInt(t, resp1.StatusCode, http.StatusOK)
 	assertString(t, receivedBody, expectedBody1) // Verify modified body
 	assertString(t, receivedApiKey, "geminikey") // Verify key in query param
-	assertString(t, receivedAuthHeader, "")     // Verify header is empty
+	assertString(t, receivedAuthHeader, "")      // Verify header is empty
 	assertString(t, receivedContentType, "application/json")
 	receivedBody, receivedApiKey, receivedAuthHeader, receivedContentType = "", "", "", "" // Reset
 
@@ -471,7 +596,7 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 	assertInt(t, resp2.StatusCode, http.StatusOK)
 	assertString(t, receivedBody, expectedBody2) // Verify modified body
 	assertString(t, receivedApiKey, "geminikey") // Verify key in query param
-	assertString(t, receivedAuthHeader, "")     // Verify header is empty
+	assertString(t, receivedAuthHeader, "")      // Verify header is empty
 	assertString(t, receivedContentType, "application/json")
 	receivedBody, receivedApiKey, receivedAuthHeader, receivedContentType = "", "", "", "" // Reset
 
@@ -487,7 +612,7 @@ func TestCreateMainHandler_GeminiPathBodyModification(t *testing.T) {
 	assertInt(t, resp3.StatusCode, http.StatusOK)
 	assertString(t, receivedBody, postBody3)     // Verify original body
 	assertString(t, receivedApiKey, "geminikey") // Verify key in query param
-	assertString(t, receivedAuthHeader, "")     // Verify header is empty
+	assertString(t, receivedAuthHeader, "")      // Verify header is empty
 	assertString(t, receivedContentType, "application/json")
 }
 
@@ -497,6 +622,10 @@ func TestCreateMainHandler_AddGoogleSearchFalse(t *testing.T) {
 	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		receivedBody = string(bodyBytes)
+		if r.URL.Query().Get("key") == "" && r.Header.Get("Authorization") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer targetServer.Close()
@@ -517,5 +646,5 @@ func TestCreateMainHandler_AddGoogleSearchFalse(t *testing.T) {
 
 	resp := rr.Result()
 	assertInt(t, resp.StatusCode, http.StatusOK)
-	assertString(t, receivedBody, postBody)
+	assertString(t, receivedBody, postBody) // Body should be unmodified
 }

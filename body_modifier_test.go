@@ -65,7 +65,7 @@ func TestHandlePostBody(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			bodyReader := stringToReadCloser(tt.body) // Changed tt.tbody to tt.body
-				gotBodyBytes, err := handlePostBody(bodyReader, tt.addGoogleSearch, tt.searchTrigger)
+			gotBodyBytes, err := handlePostBody(bodyReader, tt.addGoogleSearch, tt.searchTrigger)
 
 			if (err != nil) != tt.wantErr {
 				t.Errorf("handlePostBody() error = %v, wantErr %v", err, tt.wantErr)
@@ -127,13 +127,13 @@ func TestModifyBodyWithGoogleSearch(t *testing.T) {
 			wantBodyBytes: []byte(`{"contents": [], "tools": ` + funcDeclarationsToolJSON + `}`), // Should not modify
 			wantErr:       false,
 		},
-        {
-            name:          "trigger found (exact word, case-insensitive), no existing tools",
-            bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "Please SeArCh the web."}]}]}`),
-            searchTrigger: "search",
-            wantBodyBytes: []byte(`{"contents": [{"parts": [{"text": "Please SeArCh the web."}]}], "tools": ` + googleSearchToolJSON + `}`),
-            wantErr:       false,
-        },
+		{
+			name:          "trigger found (exact word, case-insensitive), no existing tools",
+			bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "Please SeArCh the web."}]}]}`),
+			searchTrigger: "search",
+			wantBodyBytes: []byte(`{"contents": [{"parts": [{"text": "Please SeArCh the web."}]}], "tools": ` + googleSearchToolJSON + `}`),
+			wantErr:       false,
+		},
 		{
 			name:          "trigger found (exact word), existing functionDeclarations",
 			bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": ` + funcDeclarationsToolJSON + `}`),
@@ -141,20 +141,20 @@ func TestModifyBodyWithGoogleSearch(t *testing.T) {
 			wantBodyBytes: []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": ` + googleSearchToolJSON + `}`), // Should replace tools
 			wantErr:       false,
 		},
-        {
-            name:          "trigger found (exact word), existing tools map with functionDeclarations",
-            bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"functionDeclarations": [{"name": "find_theaters"}], "other_stuff": 1}}`),
-            searchTrigger: "search",
-            wantBodyBytes: []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"google_search": {}, "other_stuff": 1}}`), // Should remove FD, add GS
-            wantErr:       false,
-        },
-        {
-            name:          "trigger found (exact word), existing tools map without functionDeclarations",
-            bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"other_stuff": 1}}`),
-            searchTrigger: "search",
-            wantBodyBytes: []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"google_search": {}, "other_stuff": 1}}`), // Should add GS
-            wantErr:       false,
-        },
+		{
+			name:          "trigger found (exact word), existing tools map with functionDeclarations",
+			bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"functionDeclarations": [{"name": "find_theaters"}], "other_stuff": 1}}`),
+			searchTrigger: "search",
+			wantBodyBytes: []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"google_search": {}, "other_stuff": 1}}`), // Should remove FD, add GS
+			wantErr:       false,
+		},
+		{
+			name:          "trigger found (exact word), existing tools map without functionDeclarations",
+			bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"other_stuff": 1}}`),
+			searchTrigger: "search",
+			wantBodyBytes: []byte(`{"contents": [{"parts": [{"text": "search now"}]}], "tools": {"google_search": {}, "other_stuff": 1}}`), // Should add GS
+			wantErr:       false,
+		},
 		{
 			name:          "trigger found but as substring, not whole word",
 			bodyBytes:     []byte(`{"contents": [{"parts": [{"text": "researching this topic"}]}]}`),
