@@ -14,7 +14,7 @@ func handlePostBody(body io.ReadCloser, addGoogleSearch bool, searchTrigger stri
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
-	log.Printf("Original Request Body: %s", string(bodyBytes))
+	// log.Printf("Original Request Body: %s", string(bodyBytes))
 
 	if !addGoogleSearch {
 		return bodyBytes, nil
@@ -212,6 +212,6 @@ func modifyBodyWithGoogleSearch(bodyBytes []byte, searchTrigger string) ([]byte,
 		return nil, fmt.Errorf("failed to marshal modified request body: %w", err)
 	}
 
-	log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
+	// log.Printf("Modified Request Body: %s", string(modifiedBodyBytes))
 	return modifiedBodyBytes, nil
 }
