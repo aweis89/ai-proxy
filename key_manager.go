@@ -268,8 +268,5 @@ func (km *keyManager) reactivateKeys() {
 				}
 			}
 		}
-		// if keysReactivatedInScope > 0 {
-		// 	log.Printf("Scope '%s': Reactivated %d keys.", scope, keysReactivatedInScope)
-		// }
 	}
 }
