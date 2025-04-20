@@ -165,6 +165,7 @@ func (km *keyManager) getNextKey(scope string) (string, int, error) {
 
 		if key, ok := state.availableKeys[keyIndex]; ok {
 			// Found an available key for this scope
+			log.Printf("Scope '%s': Selected key index %d. Available keys remaining in scope: %d", scope, keyIndex, len(state.availableKeys))
 			return key, keyIndex, nil
 		}
 	}
